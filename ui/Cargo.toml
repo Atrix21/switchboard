@@ -1,0 +1,16 @@
+[package]
+name = "switchboard-app"
+version = "0.1.0"
+edition = "2021"
+description = "Switchboard desktop app: tray icon, setup and settings"
+license = "MIT"
+
+[[bin]]
+name = "switchboard-app"
+path = "src/main.rs"
+
+[dependencies]
+serde_json = "1"
+tao = "0.37.3"
+tray-icon = "0.26.1"
+wry = "0.57.3"

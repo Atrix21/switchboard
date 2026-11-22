@@ -371,6 +371,9 @@ pub enum Ctrl {
     /// The pointer is now on `owner` (sender = Me, receiver = You). Keyboards
     /// forward keystrokes to the focus owner.
     Focus { owner: Focus },
+    /// Replace the receiver's links that point at the sender (layout set from
+    /// the other computer's app). `peer` fields are rewritten by the receiver.
+    SetLinks { links: Vec<crate::config::Link> },
     /// Ask the peer to switch the shared monitor (fallback when local DDC fails).
     MonitorSet { input: u16, req: u32 },
     MonitorResult { req: u32, ok: bool, detail: String },

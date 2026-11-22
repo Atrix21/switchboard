@@ -1580,6 +1580,22 @@ impl Engine {
                     }
                 }
             }
+            Ctrl::SetLinks { links } => {
+                let me_for_peer = p.name();
+                {
+                    let mut cfg = self.cfg.write().unwrap();
+                    cfg.links.retain(|l| l.peer != me_for_peer);
+                    for mut l in links.into_iter().take(16) {
+                        l.peer = me_for_peer.clone();
+                        cfg.links.push(l);
+                    }
+                    if let Err(e) = cfg.save() {
+                        log::error!("saving links from {}: {e}", me_for_peer);
+                    }
+                }
+                self.refresh_links();
+                log::info!("layout updated from {}", me_for_peer);
+            }
             Ctrl::MonitorSet { input, req } => {
                 let model = self.monitor.status().model;
                 let p = p.clone();
@@ -1751,6 +1767,34 @@ impl Engine {
         let park = geom::entry_point(&seg, edge, 0.5);
         self.begin_remote(st, peer.clone(), edge, seg, 0.5, park, Target::default(), "manual");
         Ok(format!("controlling {}", peer.name()))
+    }
+
+    /// Save this computer's links and send each peer its own.
+    pub fn apply_layout(&self, links: Vec<crate::config::Link>, peers: Vec<(String, Vec<crate::config::Link>)>) -> Result<(), String> {
+        for (name, _) in &peers {
+            if self.peer_by_name(name).is_none() {
+                return Err(format!("{name} isn't connected; connect it before changing the arrangement"));
+            }
+        }
+        {
+            let mut cfg = self.cfg.write().unwrap();
+            let peer_names: Vec<String> = peers.iter().map(|(n, _)| n.clone()).collect();
+            cfg.links.retain(|l| !peer_names.contains(&l.peer));
+            cfg.links.extend(links);
+            cfg.save().map_err(|e| e.to_string())?;
+        }
+        self.refresh_links();
+        let my_name = self.cfg.read().unwrap().name.clone();
+        for (name, ls) in peers {
+            if let Some(p) = self.peer_by_name(&name) {
+                let ls = ls.into_iter().map(|mut l| {
+                    l.peer = my_name.clone();
+                    l
+                }).collect();
+                std::thread::spawn(move || p.send(Ctrl::SetLinks { links: ls }));
+            }
+        }
+        Ok(())
     }
 
     pub fn reload_config(&self) {

@@ -135,6 +135,14 @@ pub fn handle(e: &Arc<Engine>, req: Value) -> Value {
                 None => Err("bad input".into()),
             }
         }
+        "layout" => {
+            let links: Result<Vec<crate::config::Link>, _> = serde_json::from_value(req["links"].clone());
+            let peers: Vec<(String, Vec<crate::config::Link>)> = req["peers"].as_array().into_iter().flatten().filter_map(|p| Some((p["name"].as_str()?.to_string(), serde_json::from_value(p["links"].clone()).ok()?))).collect();
+            match links {
+                Ok(l) => e.apply_layout(l, peers).map(|_| json!({"ok": true})),
+                Err(x) => Err(x.to_string()),
+            }
+        }
         "reload" => {
             e.reload_config();
             Ok(json!({"ok": true}))

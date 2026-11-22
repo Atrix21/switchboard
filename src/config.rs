@@ -35,7 +35,7 @@ pub struct PeerConfig {
 }
 
 /// "When the pointer leaves `screen`'s `edge`, it goes to `peer`."
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Link {
     pub edge: Edge,
     pub peer: String,
