@@ -86,6 +86,8 @@ function buildModel() {
       }
     }
   }
+  // A computer keeps the same colour in every app: assign by sorted name.
+  machines.map((m) => m.name).sort().forEach((n, i) => { machines.find((m) => m.name === n).color = COLORS[i % COLORS.length]; });
   const byName = Object.fromEntries(machines.map((m) => [m.name, m]));
   // Who is the monitor showing?
   let showing = null;

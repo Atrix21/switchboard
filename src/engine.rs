@@ -1547,6 +1547,16 @@ impl Engine {
                     if let Some(c) = self.clip.get() {
                         c.on_peer_ready(p);
                     }
+                    // A (re)connected peer doesn't know where the pointer is: if it's
+                    // here and in use, say so, so its keyboard forwards to us.
+                    let st = self.st.lock().unwrap();
+                    let here = matches!(st.mode, Mode::Local) && st.focus.is_none() && st.last_phys_motion.is_some_and(|t| t.elapsed() < Duration::from_secs(1800));
+                    let hosted_by_other = matches!(&st.mode, Mode::Hosted { peer, .. } if !Arc::ptr_eq(peer, p));
+                    drop(st);
+                    if here || hosted_by_other {
+                        let p = p.clone();
+                        std::thread::spawn(move || p.send(Ctrl::Focus { owner: Focus::Me }));
+                    }
                 }
             }
             Ctrl::Ping { t_us } => {
