@@ -41,6 +41,12 @@ pub struct Link {
     /// Restrict to one display (substring of its name). None = whole desktop edge.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub screen: Option<String>,
+    /// Land on this display of the peer (substring of its name)…
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to_screen: Option<String>,
+    /// …at this edge of it. Default: the opposite of `edge`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to_edge: Option<Edge>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

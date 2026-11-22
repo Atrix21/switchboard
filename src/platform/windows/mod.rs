@@ -156,6 +156,12 @@ pub static HOOK_SWALLOWED: AtomicU32 = AtomicU32::new(0);
 /// Raw input events seen while forwarding (diagnostics: proves raw input
 /// keeps flowing while the hook blocks the cursor).
 pub static RAW_WHILE_FORWARDING: AtomicU32 = AtomicU32::new(0);
+/// Fail-safe: set if the hook swallowed many events while no raw input
+/// arrived (i.e. we would be eating the mouse without forwarding it).
+pub static FAILSAFE_TRIPPED: AtomicBool = AtomicBool::new(false);
+static SWALLOWED_THIS_SESSION: AtomicU32 = AtomicU32::new(0);
+static RAW_THIS_SESSION: AtomicU32 = AtomicU32::new(0);
+const FAILSAFE_LIMIT: u32 = 150;
 
 const WM_APP_HOOK_ON: u32 = WM_APP + 1;
 const WM_APP_HOOK_OFF: u32 = WM_APP + 2;
@@ -165,7 +171,13 @@ unsafe extern "system" fn ll_mouse_proc(code: i32, wp: WPARAM, lp: LPARAM) -> LR
         let info = &*(lp as *const MSLLHOOKSTRUCT);
         if info.flags & LLMHF_INJECTED == 0 {
             HOOK_SWALLOWED.fetch_add(1, Ordering::Relaxed);
-            return 1;
+            let n = SWALLOWED_THIS_SESSION.fetch_add(1, Ordering::Relaxed);
+            if n > FAILSAFE_LIMIT && RAW_THIS_SESSION.load(Ordering::Relaxed) == 0 {
+                FORWARDING.store(false, Ordering::SeqCst);
+                FAILSAFE_TRIPPED.store(true, Ordering::SeqCst);
+            } else {
+                return 1;
+            }
         }
     }
     CallNextHookEx(null_mut(), code, wp, lp)
@@ -182,6 +194,10 @@ impl Capture for WinCapture {
     fn set_forwarding(&self, on: bool, park: (i32, i32)) {
         PARK_X.store(park.0, Ordering::Relaxed);
         PARK_Y.store(park.1, Ordering::Relaxed);
+        if on {
+            SWALLOWED_THIS_SESSION.store(0, Ordering::Relaxed);
+            RAW_THIS_SESSION.store(0, Ordering::Relaxed);
+        }
         let was = FORWARDING.swap(on, Ordering::SeqCst);
         if on {
             unsafe { SetCursorPos(park.0, park.1) };
@@ -304,6 +320,7 @@ unsafe fn handle_raw(ctx: &mut RawCtx, h: HRAWINPUT) {
     let m = ri.data.mouse;
     if FORWARDING.load(Ordering::Relaxed) {
         RAW_WHILE_FORWARDING.fetch_add(1, Ordering::Relaxed);
+        RAW_THIS_SESSION.fetch_add(1, Ordering::Relaxed);
     }
     let pos = cursor();
     let (mut dx, mut dy) = (m.lLastX, m.lLastY);
@@ -473,4 +490,8 @@ pub fn process_stats() -> (f64, u64) {
         GetProcessMemoryInfo(h, &mut pmc, pmc.cb);
         (ft(k) + ft(u), pmc.WorkingSetSize as u64)
     }
+}
+
+pub fn take_failsafe() -> bool {
+    FAILSAFE_TRIPPED.swap(false, Ordering::SeqCst)
 }

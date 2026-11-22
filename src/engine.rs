@@ -120,9 +120,9 @@ struct SinkState {
     last_rx: Option<Instant>,
     last_seq: u64,
     last_echo: u64,
-    ret_edge: Option<Edge>,
-    ret_seg: Rect,
-    push: Push,
+    /// (edge, segment, landing target on the source) for every link back to the source.
+    returns: Vec<(Edge, Rect, Target)>,
+    push: Vec<Push>,
     last_ack: Option<Instant>,
     received: u32,
     inject: Histogram,
@@ -163,12 +163,19 @@ pub struct Stats {
     pub sink_lost_seq: u64,
 }
 
+/// Optional explicit landing place on the other machine.
+#[derive(Clone, Debug, Default)]
+pub struct Target {
+    pub screen: Option<String>,
+    pub edge: Option<Edge>,
+}
+
 pub enum Ev {
     Connected,
     Frame(Arc<Peer>, Frame),
     Closed(Arc<Peer>),
-    SendEnter(Arc<Peer>, u32, Edge, f32),
-    SendLeave(Arc<Peer>, u32, Edge, f32),
+    SendEnter(Arc<Peer>, u32, Edge, f32, Target),
+    SendLeave(Arc<Peer>, u32, Edge, f32, Target),
     Hotkey(u32),
     Ipc(Value, Sender<Value>),
     Discovered { key_hex: String, addr: SocketAddr, name: String },
@@ -572,11 +579,12 @@ impl Engine {
             return; // fullscreen game or app has confined the cursor
         }
         let Some(peer) = self.peer_by_name(&link.peer) else { return };
-        self.begin_remote(st, peer, link.edge, seg, pos, cursor, "edge");
+        let to = Target { screen: link.to_screen.clone(), edge: link.to_edge };
+        self.begin_remote(st, peer, link.edge, seg, pos, cursor, to, "edge");
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn begin_remote(&self, st: &mut State, peer: Arc<Peer>, edge: Edge, seg: Rect, pos: f32, park: (i32, i32), reason: &str) {
+    fn begin_remote(&self, st: &mut State, peer: Arc<Peer>, edge: Edge, seg: Rect, pos: f32, park: (i32, i32), to: Target, reason: &str) {
         if peer.info.lock().unwrap().udp_addr.is_none() {
             log::warn!("cannot switch to {}: no hello yet", peer.name());
             return;
@@ -596,17 +604,24 @@ impl Engine {
             s.switches += 1;
             s.last_switch_reason = reason.into();
         }
-        let _ = self.tx.send(Ev::SendEnter(peer.clone(), epoch, edge, pos));
+        let _ = self.tx.send(Ev::SendEnter(peer.clone(), epoch, edge, pos, to));
         self.switch_monitor_to(Some(&peer));
         self.send_input(st, &peer);
     }
 
     /// Return pointer control to this machine.
-    fn end_remote(&self, st: &mut State, reason: &str, leave: Option<f32>) {
+    fn end_remote(&self, st: &mut State, reason: &str, leave: Option<(f32, Target)>) {
         let Mode::Remote { peer, epoch, exit_edge, exit_seg } = st.mode.clone() else { return };
         st.mode = Mode::Local;
-        st.push.values_mut().for_each(|p| p.reset());
-        let target = leave.map(|pos| geom::entry_point(&exit_seg, exit_edge, pos));
+        st.push.values_mut().for_each(|p| p.disarm());
+        for i in 0..st.links.len() {
+            st.push.entry(i).or_default().disarm();
+        }
+        let target = leave.as_ref().map(|(pos, to)| {
+            let screens = self.screens.read().unwrap();
+            let seg = to.screen.as_deref().and_then(|n| geom::segment(&screens, exit_edge, Some(n))).unwrap_or(exit_seg);
+            geom::entry_point(&seg, to.edge.unwrap_or(exit_edge), *pos)
+        });
         if let Some(c) = self.capture.get() {
             c.set_forwarding(false, target.unwrap_or((0, 0)));
         }
@@ -820,25 +835,32 @@ impl Engine {
         sk.inject.add(t_inj.elapsed().as_micros() as u64);
         // 4. Return edge?
         let mut leave = None;
-        if let (Some(edge), true) = (sk.ret_edge, moved != (0, 0)) {
+        if moved != (0, 0) && !sk.returns.is_empty() {
             if let Some((x, y)) = inj.cursor_pos() {
                 let screens = self.screens.read().unwrap();
-                let pos = geom::on_edge(&screens, &sk.ret_seg, edge, x, y, deadzone);
-                let out = geom::outward(edge, moved.0, moved.1);
-                if sk.push.feed(pos.is_some(), out, resistance) && sk.pressed == 0 {
-                    leave = Some((edge, pos.unwrap()));
+                if sk.push.len() != sk.returns.len() {
+                    sk.push = (0..sk.returns.len()).map(|_| Push::default()).collect();
+                }
+                for (i, (edge, seg, to)) in sk.returns.iter().enumerate() {
+                    let pos = geom::on_edge(&screens, seg, *edge, x, y, deadzone);
+                    let out = geom::outward(*edge, moved.0, moved.1);
+                    if sk.push[i].feed(pos.is_some(), out, resistance) && sk.pressed == 0 {
+                        leave = Some((*edge, pos.unwrap(), to.clone()));
+                        break;
+                    }
                 }
             }
         }
         drop(inj);
         let epoch = s.epoch;
-        if let Some((edge, pos)) = leave {
+        let left = leave.is_some();
+        if let Some((edge, pos, to)) = leave {
             st.mode = Mode::Local;
-            let _ = self.tx.send(Ev::SendLeave(peer.clone(), epoch, edge, pos));
+            let _ = self.tx.send(Ev::SendLeave(peer.clone(), epoch, edge, pos, to));
         }
         // 5. Ack (throttled).
         let sk = &mut st.sink;
-        if sk.last_ack.is_none_or(|t| t.elapsed() >= ACK_INTERVAL) || leave.is_some() {
+        if sk.last_ack.is_none_or(|t| t.elapsed() >= ACK_INTERVAL) || left {
             sk.last_ack = Some(Instant::now());
             let a = InputAck {
                 epoch,
@@ -929,7 +951,10 @@ impl Engine {
         let st = &mut *st;
         match st.mode.clone() {
             Mode::Remote { peer, .. } => {
-                if !peer.alive.load(Ordering::Relaxed) {
+                if platform::os::take_failsafe() {
+                    log::error!("FAIL-SAFE: local mouse was being blocked but raw input was not arriving; returned control");
+                    self.end_remote(st, "fail-safe (raw input missing)", None);
+                } else if !peer.alive.load(Ordering::Relaxed) {
                     self.end_remote(st, "peer disconnected", None);
                 } else if st.last_ack.elapsed() > timeout {
                     self.end_remote(st, "peer stopped responding", None);
@@ -991,13 +1016,13 @@ impl Engine {
                 self.peers.write().unwrap().retain(|q| !Arc::ptr_eq(q, &p));
                 self.tick();
             }
-            Ev::SendEnter(p, epoch, edge, pos) => p.send(Ctrl::Enter { epoch, edge, pos }),
-            Ev::SendLeave(p, epoch, edge, pos) => {
+            Ev::SendEnter(p, epoch, edge, pos, to) => p.send(Ctrl::Enter { epoch, edge, pos, to_screen: to.screen, to_edge: to.edge }),
+            Ev::SendLeave(p, epoch, edge, pos, to) => {
                 {
                     let mut st = self.st.lock().unwrap();
                     self.release_all_injected(&mut st);
                 }
-                p.send(Ctrl::Leave { epoch, edge, pos });
+                p.send(Ctrl::Leave { epoch, edge, pos, to_screen: to.screen, to_edge: to.edge });
                 log::info!("pointer returned to {}", p.name());
             }
             Ev::Hotkey(id) => self.on_hotkey(id),
@@ -1054,7 +1079,7 @@ impl Engine {
                     log::info!("forwarding re-enabled");
                 }
                 match st.mode.clone() {
-                    Mode::Remote { .. } => self.end_remote(st, "hotkey", Some(0.5)),
+                    Mode::Remote { .. } => self.end_remote(st, "hotkey", Some((0.5, Target::default()))),
                     Mode::Hosted { peer, .. } => {
                         let p = peer.clone();
                         std::thread::spawn(move || p.send(Ctrl::RequestFocus { target: Focus::You }));
@@ -1066,7 +1091,7 @@ impl Engine {
                             let screens = self.screens.read().unwrap().clone();
                             let (edge, seg) = st.links.iter().find(|(l, _)| l.peer == peer.name()).map(|(l, r)| (l.edge, *r)).unwrap_or((Edge::Right, geom::desktop(&screens)));
                             let park = geom::entry_point(&seg, edge, 0.5);
-                            self.begin_remote(st, peer, edge, seg, 0.5, park, "hotkey");
+                            self.begin_remote(st, peer, edge, seg, 0.5, park, Target::default(), "hotkey");
                         } else {
                             let p = peer.clone();
                             std::thread::spawn(move || p.send(Ctrl::RequestFocus { target: Focus::Me }));
@@ -1127,37 +1152,43 @@ impl Engine {
                 p.sess.shutdown();
             }
             _ if !trusted => log::warn!("ignoring message from unpaired device {}", p.fp),
-            Ctrl::Enter { epoch, edge, pos } => {
+            Ctrl::Enter { epoch, edge, pos, to_screen, to_edge } => {
                 let mut st = self.st.lock().unwrap();
                 let st = &mut *st;
                 if st.disabled {
                     let p = p.clone();
-                    std::thread::spawn(move || p.send(Ctrl::Leave { epoch, edge: edge.opposite(), pos }));
+                    std::thread::spawn(move || p.send(Ctrl::Leave { epoch, edge: edge.opposite(), pos, to_screen: None, to_edge: None }));
                     return;
                 }
                 if let Mode::Remote { peer, .. } = &st.mode {
                     // Both sides crossed at once: the smaller fingerprint stays source.
                     if Arc::ptr_eq(peer, p) && self.fp < p.fp {
                         let p = p.clone();
-                        std::thread::spawn(move || p.send(Ctrl::Leave { epoch, edge: edge.opposite(), pos }));
+                        std::thread::spawn(move || p.send(Ctrl::Leave { epoch, edge: edge.opposite(), pos, to_screen: None, to_edge: None }));
                         return;
                     }
                     self.end_remote(st, "peer took control", None);
                 }
                 let screens = self.screens.read().unwrap().clone();
-                let (ret_edge, seg) = st.links.iter().find(|(l, _)| l.peer == p.name()).map(|(l, r)| (l.edge, *r)).unwrap_or_else(|| (edge.opposite(), geom::desktop(&screens)));
-                st.sink = SinkState { ret_edge: Some(ret_edge), ret_seg: seg, ..Default::default() };
+                let returns: Vec<(Edge, Rect, Target)> = st.links.iter().filter(|(l, _)| l.peer == p.name()).map(|(l, r)| (l.edge, *r, Target { screen: l.to_screen.clone(), edge: l.to_edge })).collect();
+                // Landing place: explicit target from the source, else our first link to it, else the opposite edge of the desktop.
+                let land_edge = to_edge.unwrap_or_else(|| returns.first().map(|r| r.0).unwrap_or(edge.opposite()));
+                let land_seg = to_screen.as_deref().and_then(|n| geom::segment(&screens, land_edge, Some(n))).or_else(|| returns.first().map(|r| r.1)).unwrap_or_else(|| geom::desktop(&screens));
+                let returns = if returns.is_empty() { vec![(land_edge, land_seg, Target::default())] } else { returns };
+                let push = returns.iter().map(|_| { let mut p = Push::default(); p.disarm(); p }).collect();
+                st.sink = SinkState { returns, push, ..Default::default() };
                 st.mode = Mode::Hosted { peer: p.clone(), epoch };
-                let (x, y) = geom::entry_point(&seg, ret_edge, pos);
+                let (x, y) = geom::entry_point(&land_seg, land_edge, pos);
                 let _ = self.inj.lock().unwrap().warp(x, y);
+                let ret_edge = land_edge;
                 log::info!("pointer from {} entered at ({x},{y}) via {ret_edge:?}", p.name());
                 self.stats.lock().unwrap().switches += 1;
             }
-            Ctrl::Leave { epoch, edge: _, pos } => {
+            Ctrl::Leave { epoch, edge: _, pos, to_screen, to_edge } => {
                 let mut st = self.st.lock().unwrap();
                 if let Mode::Remote { peer, epoch: e, .. } = &st.mode {
                     if Arc::ptr_eq(peer, p) && *e == epoch {
-                        self.end_remote(&mut st, "edge", Some(pos));
+                        self.end_remote(&mut st, "edge", Some((pos, Target { screen: to_screen, edge: to_edge })));
                     }
                 }
             }
@@ -1176,13 +1207,13 @@ impl Engine {
                 let st = &mut *st;
                 match (target, st.mode.clone()) {
                     // Peer wants the pointer back from us (we control it): stop.
-                    (Focus::You, Mode::Remote { peer, .. }) if Arc::ptr_eq(&peer, p) => self.end_remote(st, "peer requested", Some(0.5)),
+                    (Focus::You, Mode::Remote { peer, .. }) if Arc::ptr_eq(&peer, p) => self.end_remote(st, "peer requested", Some((0.5, Target::default()))),
                     // Peer wants our pointer on their machine.
                     (Focus::Me, Mode::Local) if !st.disabled => {
                         let screens = self.screens.read().unwrap().clone();
                         let (edge, seg) = st.links.iter().find(|(l, _)| l.peer == p.name()).map(|(l, r)| (l.edge, *r)).unwrap_or((Edge::Right, geom::desktop(&screens)));
                         let park = geom::entry_point(&seg, edge, 0.5);
-                        self.begin_remote(st, p.clone(), edge, seg, 0.5, park, "peer hotkey");
+                        self.begin_remote(st, p.clone(), edge, seg, 0.5, park, Target::default(), "peer hotkey");
                     }
                     _ => {}
                 }
@@ -1313,6 +1344,8 @@ impl Engine {
                 "acks": stats.acks,
                 "switches": stats.switches,
                 "last_switch_reason": stats.last_switch_reason,
+                "hook_swallowed": hook_counters().0,
+                "raw_while_forwarding": hook_counters().1,
                 "cpu_s": cpu,
                 "rss_bytes": mem,
             }
@@ -1334,7 +1367,7 @@ impl Engine {
         let st = &mut *st;
         if target == "local" || target == self.cfg.read().unwrap().name {
             match st.mode.clone() {
-                Mode::Remote { .. } => self.end_remote(st, "manual", Some(0.5)),
+                Mode::Remote { .. } => self.end_remote(st, "manual", Some((0.5, Target::default()))),
                 Mode::Hosted { peer, .. } => {
                     let p = peer.clone();
                     std::thread::spawn(move || p.send(Ctrl::RequestFocus { target: Focus::You }));
@@ -1350,7 +1383,7 @@ impl Engine {
         let screens = self.screens.read().unwrap().clone();
         let (edge, seg) = st.links.iter().find(|(l, _)| l.peer == peer.name()).map(|(l, r)| (l.edge, *r)).unwrap_or((Edge::Right, geom::desktop(&screens)));
         let park = geom::entry_point(&seg, edge, 0.5);
-        self.begin_remote(st, peer.clone(), edge, seg, 0.5, park, "manual");
+        self.begin_remote(st, peer.clone(), edge, seg, 0.5, park, Target::default(), "manual");
         Ok(format!("controlling {}", peer.name()))
     }
 
@@ -1379,6 +1412,17 @@ impl Engine {
 
     pub fn discovered_peer(&self, key_hex: String, addr: SocketAddr, name: String) {
         let _ = self.tx.send(Ev::Discovered { key_hex, addr, name });
+    }
+}
+
+fn hook_counters() -> (u32, u32) {
+    #[cfg(windows)]
+    {
+        (platform::os::HOOK_SWALLOWED.load(Ordering::Relaxed), platform::os::RAW_WHILE_FORWARDING.load(Ordering::Relaxed))
+    }
+    #[cfg(not(windows))]
+    {
+        (0, 0)
     }
 }
 

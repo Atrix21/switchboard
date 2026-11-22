@@ -264,9 +264,27 @@ pub enum Ctrl {
     Pong { t_us: u64 },
     /// Source -> sink: you now own the pointer. `pos` is 0..1 along `edge` of
     /// the sink's virtual desktop where the pointer should appear.
-    Enter { epoch: u32, edge: Edge, pos: f32 },
+    /// `to_screen`/`to_edge`: optional explicit landing place on the sink
+    /// (from the source's link config); otherwise the sink decides.
+    Enter {
+        epoch: u32,
+        edge: Edge,
+        pos: f32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        to_screen: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        to_edge: Option<Edge>,
+    },
     /// Sink -> source: pointer crossed back out of `edge` at `pos`.
-    Leave { epoch: u32, edge: Edge, pos: f32 },
+    Leave {
+        epoch: u32,
+        edge: Edge,
+        pos: f32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        to_screen: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        to_edge: Option<Edge>,
+    },
     /// Source -> sink: control revoked (manual switch / emergency / shutdown).
     /// Sink must release all buttons.
     Revoke { epoch: u32 },
@@ -374,7 +392,7 @@ mod tests {
     fn ctrl_roundtrip() {
         let m = Frame::Data { id: 4, last: true, bytes: vec![0, 1, 2, 255] };
         assert_eq!(Frame::decode(&m.encode()).unwrap(), m);
-        let m = Frame::Ctrl(Ctrl::Enter { epoch: 2, edge: Edge::Right, pos: 0.5 });
+        let m = Frame::Ctrl(Ctrl::Enter { epoch: 2, edge: Edge::Right, pos: 0.5, to_screen: Some("AW".into()), to_edge: None });
         assert_eq!(Frame::decode(&m.encode()).unwrap(), m);
     }
 }

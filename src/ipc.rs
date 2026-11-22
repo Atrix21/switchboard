@@ -110,8 +110,12 @@ pub fn handle(e: &Arc<Engine>, req: Value) -> Value {
                     let screen = s("screen");
                     {
                         let mut c = e.cfg.write().unwrap();
-                        c.links.retain(|l| l.peer != peer);
-                        c.links.push(crate::config::Link { edge, peer: peer.clone(), screen });
+                        if req["replace"].as_bool().unwrap_or(true) {
+                            c.links.retain(|l| l.peer != peer);
+                        }
+                        let to_screen = s("to_screen");
+                        let to_edge = serde_json::from_value(req["to_edge"].clone()).ok();
+                        c.links.push(crate::config::Link { edge, peer: peer.clone(), screen, to_screen, to_edge });
                         let _ = c.save();
                     }
                     e.reload_config();

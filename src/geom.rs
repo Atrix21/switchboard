@@ -82,14 +82,35 @@ pub fn entry_point(seg: &Rect, edge: Edge, pos: f32) -> (i32, i32) {
 }
 
 /// Edge-push accumulator implementing configurable resistance.
-#[derive(Default, Debug)]
+///
+/// A disarmed edge ignores pushes until the pointer has been off it once:
+/// after arriving *on* an edge (e.g. a monitor "flip" gesture) a continued
+/// push must not bounce the pointer straight back.
+#[derive(Debug)]
 pub struct Push {
     acc: i32,
+    armed: bool,
+}
+
+impl Default for Push {
+    fn default() -> Self {
+        Push { acc: 0, armed: true }
+    }
 }
 
 impl Push {
+    pub fn disarm(&mut self) {
+        self.acc = 0;
+        self.armed = false;
+    }
     /// Feed one motion sample. Returns true when the push exceeds `resistance`.
     pub fn feed(&mut self, on_edge: bool, out: i32, resistance: i32) -> bool {
+        if !on_edge {
+            self.armed = true;
+        }
+        if !self.armed {
+            return false;
+        }
         if !on_edge || out <= 0 {
             if out < 0 || !on_edge {
                 self.acc = 0;
@@ -102,9 +123,6 @@ impl Push {
             return true;
         }
         false
-    }
-    pub fn reset(&mut self) {
-        self.acc = 0;
     }
 }
 
@@ -163,5 +181,10 @@ mod tests {
         assert!(!p.feed(true, 5, 10));
         assert!(!p.feed(false, 0, 10));
         assert!(!p.feed(true, 8, 10), "reset after leaving edge");
+        let mut p = Push::default();
+        p.disarm();
+        assert!(!p.feed(true, 50, 0), "disarmed on arrival");
+        assert!(!p.feed(false, -1, 0));
+        assert!(p.feed(true, 1, 0), "re-armed after leaving the edge");
     }
 }
