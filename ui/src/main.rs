@@ -23,6 +23,7 @@ const CSS: &str = include_str!("../web/app.css");
 const JS: &str = include_str!("../web/app.js");
 const THREE: &str = include_str!("../web/vendor/three.min.js");
 const DESK3D: &str = include_str!("../web/desk3d.js");
+const DEMO: &str = include_str!("../web/demo.js");
 
 #[derive(Debug)]
 enum UserEvent {
@@ -39,17 +40,23 @@ struct Ui {
 }
 
 fn page() -> String {
-    HTML.replace("/*CSS*/", CSS).replace("/*THREE*/", THREE).replace("/*DESK3D*/", DESK3D).replace("/*JS*/", JS)
+    HTML.replace("/*CSS*/", CSS).replace("/*THREE*/", THREE).replace("/*DESK3D*/", DESK3D).replace("/*DEMO*/", DEMO).replace("/*JS*/", JS)
 }
 
 fn main() {
     let background = std::env::args().any(|a| a == "--background");
+    let demo = std::env::args().any(|a| a == "--demo");
+    if demo {
+        std::env::set_var("SWITCHBOARD_DEMO", "1");
+    }
     // Single instance: a second launch just asks the first to show its window.
     let Some(guard) = daemon::single_instance() else {
         daemon::poke_existing();
         return;
     };
-    daemon::ensure_running();
+    if !demo {
+        daemon::ensure_running();
+    }
 
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
     let proxy = event_loop.create_proxy();
@@ -187,7 +194,12 @@ fn open_window(target: &tao::event_loop::EventLoopWindowTarget<UserEvent>, proxy
     let p = proxy.clone();
     let builder = WebViewBuilder::new()
         .with_html(page())
-        .with_initialization_script(&format!("window.__SB_VIEW = {:?};", std::env::var("SWITCHBOARD_VIEW").unwrap_or_default()))
+        .with_initialization_script(&format!(
+            "window.__SB_VIEW = {:?}; window.__SB_OPEN = {:?}; window.__SB_DEMO = {};",
+            std::env::var("SWITCHBOARD_VIEW").unwrap_or_default(),
+            std::env::var("SWITCHBOARD_OPEN").unwrap_or_default(),
+            std::env::var("SWITCHBOARD_DEMO").is_ok()
+        ))
         .with_devtools(std::env::var("SWITCHBOARD_DEVTOOLS").is_ok())
         .with_ipc_handler(move |req: wry::http::Request<String>| {
             let p = p.clone();

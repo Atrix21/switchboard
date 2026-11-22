@@ -1,0 +1,53 @@
+name: release
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build
+        shell: pwsh
+        run: ./packaging/windows/build-release.ps1
+      - uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: dist/*.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: dist/*.zip
+
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev
+      - run: ./packaging/linux/build-deb.sh
+      - uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: dist/deb/*.deb
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: dist/deb/*.deb
+
+  publish:
+    needs: [windows, linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: out/**/*
+          generate_release_notes: true

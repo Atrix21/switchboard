@@ -1,0 +1,31 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Desktop app build dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev
+      - name: Unit tests
+        run: cargo test -p switchboard
+      - name: Build
+        run: cargo build -p switchboard -p switchboard-app
+      - name: End-to-end (two services, 0% and 50% packet loss)
+        shell: bash
+        run: |
+          BIN=target/debug/switchboard
+          [ "$RUNNER_OS" = "Windows" ] && BIN="$(pwd -W 2>/dev/null || pwd)/target/debug/switchboard.exe"
+          python3 tests/e2e_loopback.py "$BIN" 0 || python tests/e2e_loopback.py "$BIN" 0
+          python3 tests/e2e_loopback.py "$BIN" 2 || python tests/e2e_loopback.py "$BIN" 2

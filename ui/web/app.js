@@ -909,10 +909,11 @@ async function refreshConfig() {
 }
 
 window.addEventListener("resize", () => render());
-(async function boot() {
+// Boot after every script has loaded (demo mode replaces the bridge first).
+window.addEventListener("DOMContentLoaded", async function boot() {
   await refreshConfig();
   await refresh();
   render();
   setInterval(refresh, 700);
   setInterval(refreshConfig, 5000);
-})();
+});
