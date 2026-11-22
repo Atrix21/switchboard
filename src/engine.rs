@@ -56,6 +56,7 @@ pub struct PeerInfo {
     pub monitor_input: Option<u16>,
     pub rtt: Histogram,
     pub hello: bool,
+    pub links: Vec<crate::config::Link>,
 }
 
 pub struct Peer {
@@ -122,7 +123,8 @@ struct SinkState {
     last_seq: u64,
     last_echo: u64,
     /// (edge, segment, landing target on the source) for every link back to the source.
-    returns: Vec<(Edge, Rect, Target, u64)>,
+    /// (edge, segment, landing target, dwell ms, link) for every link back to the source.
+    returns: Vec<(Edge, Rect, Target, u64, Link)>,
     push: Vec<Push>,
     last_ack: Option<Instant>,
     received: u32,
@@ -201,6 +203,7 @@ pub struct Stats {
 pub struct Target {
     pub screen: Option<String>,
     pub edge: Option<Edge>,
+    pub switch_monitor: Option<bool>,
 }
 
 pub enum Ev {
@@ -336,6 +339,19 @@ impl Engine {
             })));
         }
 
+        // Tell peers whenever we switch the shared monitor, so edge conditions
+        // ("only while it shows the other computer") are correct instantly.
+        {
+            let w = Arc::downgrade(&e);
+            e.monitor.set_on_switched(Some(Box::new(move |input| {
+                if let Some(e) = w.upgrade() {
+                    for p in e.trusted_peers() {
+                        std::thread::spawn(move || p.send(Ctrl::MonitorShows { input }));
+                    }
+                }
+            })));
+        }
+
         // Monitor switched with its own buttons -> follow it.
         if e.cfg.read().unwrap().monitor.follow_manual_switch {
             let w = Arc::downgrade(&e);
@@ -397,11 +413,7 @@ impl Engine {
             log::info!("display layout changed: {}", s.iter().map(|s| format!("{} {:?}", s.name, s.rect)).collect::<Vec<_>>().join(", "));
             *self.screens.write().unwrap() = s.clone();
             self.refresh_links();
-            for p in self.peers.read().unwrap().iter() {
-                if p.trusted.load(Ordering::Relaxed) {
-                    p.send(self.hello());
-                }
-            }
+            self.announce();
         }
     }
 
@@ -417,7 +429,43 @@ impl Engine {
             screens: self.screens.read().unwrap().clone(),
             monitor_model: ms.model,
             monitor_input: ms.local_input,
+            links: cfg.links.clone(),
         }
+    }
+
+    /// (Re)send our Hello to every paired peer (screens, links or monitor changed).
+    fn announce(&self) {
+        for p in self.trusted_peers() {
+            let mut h = self.hello();
+            if let Ctrl::Hello { udp_session, .. } = &mut h {
+                *udp_session = p.recv_id;
+            }
+            std::thread::spawn(move || p.send(h));
+        }
+    }
+
+    /// Model-name core of the shared monitor ("AW2726DM"), if one is configured.
+    fn shared_core(&self) -> Option<String> {
+        let m = self.monitor.status().model;
+        (!m.is_empty()).then(|| model_core(&m))
+    }
+
+    /// Is the shared monitor currently showing another computer?
+    fn shared_shows_other(&self) -> bool {
+        let ms = self.monitor.status();
+        matches!((ms.observed, ms.local_input), (Some(o), Some(l)) if o & 0xff != l & 0xff)
+    }
+
+    /// Screens to test an edge against: for conditional links while the shared
+    /// monitor shows someone else, its (invisible) screen does not block.
+    fn edge_screens(&self, link: &Link, all: &[ScreenInfo], shows_other: bool, core: &Option<String>) -> Option<Vec<ScreenInfo>> {
+        if link.when.as_deref() != Some("shared_shows_other") {
+            return Some(all.to_vec());
+        }
+        if !shows_other {
+            return None;
+        }
+        Some(all.iter().filter(|s| core.as_ref().is_none_or(|c| !s.name.contains(c.as_str()))).cloned().collect())
     }
 
     // ------------------------------------------------------------ connections
@@ -628,10 +676,16 @@ impl Engine {
             let c = self.cfg.read().unwrap();
             (c.switching.edge_resistance, c.switching.corner_deadzone, c.switching.lock_while_button_held)
         };
-        let screens = self.screens.read().unwrap();
+        let screens = self.screens.read().unwrap().clone();
+        let shows_other = self.shared_shows_other();
+        let core = self.shared_core();
         let mut hit = None;
         for (i, (link, seg)) in st.links.iter().enumerate() {
-            let pos = geom::on_edge(&screens, seg, link.edge, cursor.0, cursor.1, deadzone);
+            let Some(scr) = self.edge_screens(link, &screens, shows_other, &core) else {
+                st.push.entry(i).or_default().feed(false, 0, 0);
+                continue;
+            };
+            let pos = geom::on_edge(&scr, seg, link.edge, cursor.0, cursor.1, deadzone);
             let out = geom::outward(link.edge, dx, dy);
             let push = st.push.entry(i).or_default();
             if push.feed_dwell(pos.is_some(), out, resistance, Duration::from_millis(link.dwell_ms.unwrap_or(0))) {
@@ -649,7 +703,7 @@ impl Engine {
             return; // fullscreen game or app has confined the cursor
         }
         let Some(peer) = self.peer_by_name(&link.peer) else { return };
-        let to = Target { screen: link.to_screen.clone(), edge: link.to_edge };
+        let to = Target { screen: link.to_screen.clone(), edge: link.to_edge, switch_monitor: link.switch_monitor };
         self.begin_remote(st, peer, link.edge, seg, pos, cursor, to, "edge");
     }
 
@@ -674,15 +728,19 @@ impl Engine {
             s.switches += 1;
             s.last_switch_reason = reason.into();
         }
+        let switch_monitor = to.switch_monitor != Some(false);
         let _ = self.tx.send(Ev::SendEnter(peer.clone(), epoch, edge, pos, to));
         self.set_focus(st, Some(peer.clone()));
-        self.switch_monitor_to(Some(&peer));
+        if switch_monitor {
+            self.switch_monitor_to(Some(&peer));
+        }
         self.send_input(st, &peer);
     }
 
     /// Return pointer control to this machine.
     fn end_remote(&self, st: &mut State, reason: &str, leave: Option<(f32, Target)>) {
         let Mode::Remote { peer, epoch, exit_edge, exit_seg } = st.mode.clone() else { return };
+        let switch_monitor = leave.as_ref().is_none_or(|(_, t)| t.switch_monitor != Some(false));
         st.mode = Mode::Local;
         st.push.values_mut().for_each(|p| p.disarm());
         for i in 0..st.links.len() {
@@ -713,7 +771,9 @@ impl Engine {
             s.switches += 1;
             s.last_switch_reason = reason.into();
         }
-        self.switch_monitor_to(None);
+        if switch_monitor {
+            self.switch_monitor_to(None);
+        }
     }
 
     fn send_input(&self, st: &mut State, peer: &Peer) {
@@ -1098,12 +1158,15 @@ impl Engine {
         let mut leave = None;
         if moved != (0, 0) && !sk.returns.is_empty() {
             if let Some((x, y)) = inj.cursor_pos() {
-                let screens = self.screens.read().unwrap();
+                let screens = self.screens.read().unwrap().clone();
+                let shows_other = self.shared_shows_other();
+                let core = self.shared_core();
                 if sk.push.len() != sk.returns.len() {
                     sk.push = (0..sk.returns.len()).map(|_| Push::default()).collect();
                 }
-                for (i, (edge, seg, to, dwell)) in sk.returns.iter().enumerate() {
-                    let pos = geom::on_edge(&screens, seg, *edge, x, y, deadzone);
+                for (i, (edge, seg, to, dwell, link)) in sk.returns.iter().enumerate() {
+                    let Some(scr) = self.edge_screens(link, &screens, shows_other, &core) else { continue };
+                    let pos = geom::on_edge(&scr, seg, *edge, x, y, deadzone);
                     let out = geom::outward(*edge, moved.0, moved.1);
                     if sk.push[i].feed_dwell(pos.is_some(), out, resistance, Duration::from_millis(*dwell)) && sk.pressed == 0 {
                         leave = Some((*edge, pos.unwrap(), to.clone()));
@@ -1338,7 +1401,7 @@ impl Engine {
                     let mut st = self.st.lock().unwrap();
                     self.release_all_injected(&mut st);
                 }
-                p.send(Ctrl::Leave { epoch, edge, pos, to_screen: to.screen, to_edge: to.edge });
+                p.send(Ctrl::Leave { epoch, edge, pos, to_screen: to.screen, to_edge: to.edge, switch_monitor: to.switch_monitor });
                 log::info!("pointer returned to {}", p.name());
             }
             Ev::Hotkey(id) => self.on_hotkey(id),
@@ -1462,7 +1525,7 @@ impl Engine {
     fn on_ctrl(self: &Arc<Self>, p: &Arc<Peer>, m: Ctrl) {
         let trusted = p.trusted.load(Ordering::Relaxed);
         match m {
-            Ctrl::Hello { version, name, os, udp_port, udp_session, screens, monitor_model, monitor_input } => {
+            Ctrl::Hello { version, name, os, udp_port, udp_session, screens, monitor_model, monitor_input, links } => {
                 if version != PROTOCOL_VERSION {
                     log::warn!("peer {} speaks protocol v{version}, we speak v{PROTOCOL_VERSION}", p.fp);
                 }
@@ -1476,6 +1539,7 @@ impl Engine {
                 i.screens = screens;
                 i.monitor_model = monitor_model;
                 i.monitor_input = monitor_input;
+                i.links = links;
                 i.hello = true;
                 log::info!("hello from {} ({}), monitor {:?} input {:?}", i.name, i.os, i.monitor_model, i.monitor_input.map(crate::config::input_name));
                 drop(i);
@@ -1513,24 +1577,29 @@ impl Engine {
                 let st = &mut *st;
                 if st.disabled {
                     let p = p.clone();
-                    std::thread::spawn(move || p.send(Ctrl::Leave { epoch, edge: edge.opposite(), pos, to_screen: None, to_edge: None }));
+                    std::thread::spawn(move || p.send(Ctrl::Leave { epoch, edge: edge.opposite(), pos, to_screen: None, to_edge: None, switch_monitor: Some(false) }));
                     return;
                 }
                 if let Mode::Remote { peer, .. } = &st.mode {
                     // Both sides crossed at once: the smaller fingerprint stays source.
                     if Arc::ptr_eq(peer, p) && self.fp < p.fp {
                         let p = p.clone();
-                        std::thread::spawn(move || p.send(Ctrl::Leave { epoch, edge: edge.opposite(), pos, to_screen: None, to_edge: None }));
+                        std::thread::spawn(move || p.send(Ctrl::Leave { epoch, edge: edge.opposite(), pos, to_screen: None, to_edge: None, switch_monitor: Some(false) }));
                         return;
                     }
                     self.end_remote(st, "peer took control", None);
                 }
                 let screens = self.screens.read().unwrap().clone();
-                let returns: Vec<(Edge, Rect, Target, u64)> = st.links.iter().filter(|(l, _)| l.peer == p.name()).map(|(l, r)| (l.edge, *r, Target { screen: l.to_screen.clone(), edge: l.to_edge }, l.dwell_ms.unwrap_or(0))).collect();
+                let returns: Vec<(Edge, Rect, Target, u64, Link)> = st.links.iter().filter(|(l, _)| l.peer == p.name()).map(|(l, r)| (l.edge, *r, Target { screen: l.to_screen.clone(), edge: l.to_edge, switch_monitor: l.switch_monitor }, l.dwell_ms.unwrap_or(0), l.clone())).collect();
                 // Landing place: explicit target from the source, else our first link to it, else the opposite edge of the desktop.
                 let land_edge = to_edge.unwrap_or_else(|| returns.first().map(|r| r.0).unwrap_or(edge.opposite()));
                 let land_seg = to_screen.as_deref().and_then(|n| geom::segment(&screens, land_edge, Some(n))).or_else(|| returns.first().map(|r| r.1)).unwrap_or_else(|| geom::desktop(&screens));
-                let returns = if returns.is_empty() { vec![(land_edge, land_seg, Target::default(), 0)] } else { returns };
+                let returns = if returns.is_empty() {
+                    let l = Link { edge: land_edge, peer: p.name(), screen: None, to_screen: None, to_edge: None, dwell_ms: None, switch_monitor: None, when: None };
+                    vec![(land_edge, land_seg, Target::default(), 0, l)]
+                } else {
+                    returns
+                };
                 let push = returns.iter().map(|_| { let mut p = Push::default(); p.disarm(); p }).collect();
                 st.sink = SinkState { returns, push, ..Default::default() };
                 st.mode = Mode::Hosted { peer: p.clone(), epoch };
@@ -1541,11 +1610,11 @@ impl Engine {
                 log::info!("pointer from {} entered at ({x},{y}) via {ret_edge:?}", p.name());
                 self.stats.lock().unwrap().switches += 1;
             }
-            Ctrl::Leave { epoch, edge: _, pos, to_screen, to_edge } => {
+            Ctrl::Leave { epoch, edge: _, pos, to_screen, to_edge, switch_monitor } => {
                 let mut st = self.st.lock().unwrap();
                 if let Mode::Remote { peer, epoch: e, .. } = &st.mode {
                     if Arc::ptr_eq(peer, p) && *e == epoch {
-                        self.end_remote(&mut st, "edge", Some((pos, Target { screen: to_screen, edge: to_edge })));
+                        self.end_remote(&mut st, "edge", Some((pos, Target { screen: to_screen, edge: to_edge, switch_monitor })));
                     }
                 }
             }
@@ -1585,6 +1654,9 @@ impl Engine {
                     }
                 }
             }
+            Ctrl::MonitorShows { input } => {
+                self.monitor.set_observed(input);
+            }
             Ctrl::SetLinks { links } => {
                 let me_for_peer = p.name();
                 {
@@ -1599,6 +1671,7 @@ impl Engine {
                     }
                 }
                 self.refresh_links();
+                self.announce();
                 log::info!("layout updated from {}", me_for_peer);
             }
             Ctrl::MonitorSet { input, req } => {
@@ -1691,6 +1764,7 @@ impl Engine {
                     "confirmed_here": p.pair_local.load(Ordering::Relaxed),
                     "rtt_ms": { "p50": i.rtt.percentile(50.0) as f64 / 1000.0, "p95": i.rtt.percentile(95.0) as f64 / 1000.0, "p99": i.rtt.percentile(99.0) as f64 / 1000.0, "samples": i.rtt.len() },
                     "monitor_input": i.monitor_input.map(crate::config::input_name),
+                    "links": i.links,
                     "screens": i.screens,
                     "connected_s": p.connected_at.elapsed().as_secs(),
                 })
@@ -1789,6 +1863,7 @@ impl Engine {
             cfg.save().map_err(|e| e.to_string())?;
         }
         self.refresh_links();
+        self.announce();
         let my_name = self.cfg.read().unwrap().name.clone();
         for (name, ls) in peers {
             if let Some(p) = self.peer_by_name(&name) {
@@ -1806,6 +1881,7 @@ impl Engine {
         let c = Config::load();
         *self.cfg.write().unwrap() = c;
         self.refresh_links();
+        self.announce();
     }
 
     pub fn shutdown(&self) {

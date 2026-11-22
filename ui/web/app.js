@@ -79,7 +79,10 @@ function buildModel() {
         if (!shared) { shared = { id: "shared", shared: true, name: shortScreenName(s.name), names: {}, rect: s.rect, laptop: false }; displays.push(shared); }
         shared.names[m.name] = s.name;
       } else {
-        displays.push({ id: m.name + "::" + s.name, machine: m.name, name: shortScreenName(s.name), osName: s.name, rect: s.rect, laptop: isLaptopPanel(s), primary: s.primary });
+        // Stable key: the monitor name without the OS device suffix, when unique on that computer.
+        const bare = s.name.replace(/\s*\[.*\]\s*$/, "");
+        const key = m.screens.filter((o) => o.name.startsWith(bare)).length === 1 ? bare : s.name;
+        displays.push({ id: m.name + "::" + s.name, machine: m.name, name: shortScreenName(s.name), osName: key, rect: s.rect, laptop: isLaptopPanel(s), primary: s.primary });
       }
     }
   }
@@ -127,44 +130,104 @@ function defaultOrder(M) {
   return order;
 }
 
-/* ------------------------------------------------------------------ planning
-   Turn a left-to-right arrangement into links for every machine.
-   Adjacent displays of different computers: crossing in both directions.
-   The shared monitor: a "flip" at its outer edge on every computer. */
-function planLinks(M, order) {
+/* ------------------------------------------------------------------ connections
+   A connection is one-way: "leave <screen> of <machine> through <edge>, arrive
+   at <to_edge> of <to_screen> on <peer>". Each computer stores its own. */
+
+/* Every computer's connections: this computer's from config, peers' from their Hello. */
+function allLinks() {
+  if (S.plan) return S.plan;
+  const st = S.status, out = { [st.name]: (st.links || []).map((l) => ({ ...l })) };
+  for (const p of st.peers || []) if (p.trusted) out[p.name] = (p.links || []).map((l) => ({ ...l }));
+  return out;
+}
+
+function isShared(M, screenName) { return !!(M.core && screenName && screenName.includes(M.core)); }
+
+/* What the OS's own layout puts beyond this edge, if anything. */
+function beyond(M, machineName, screenSub, edge) {
+  const m = M.byName[machineName];
+  if (!m) return null;
+  const seg = m.screens.find((s) => s.name.includes(screenSub));
+  if (!seg) return null;
+  const r = seg.rect;
+  const probe = { left: [r.x - 1, r.y + r.h / 2], right: [r.x + r.w, r.y + r.h / 2], top: [r.x + r.w / 2, r.y - 1], bottom: [r.x + r.w / 2, r.y + r.h] }[edge];
+  return m.screens.find((s) => s !== seg && probe[0] >= s.rect.x && probe[0] < s.rect.x + s.rect.w && probe[1] >= s.rect.y && probe[1] < s.rect.y + s.rect.h) || null;
+}
+
+/* "open" | "conditional" (works while the shared monitor shows another computer) | "blocked" */
+function edgeState(M, machineName, link) {
+  const b = beyond(M, machineName, link.screen, link.edge);
+  if (!b) return { state: "open" };
+  if (isShared(M, b.name) && link.when === "shared_shows_other") return { state: "conditional", by: shortScreenName(b.name) };
+  return { state: "blocked", by: shortScreenName(b.name), shared: isShared(M, b.name) };
+}
+function blockedBy(M, machineName, link) {
+  const s = edgeState(M, machineName, link);
+  return s.state === "blocked" ? s.by : null;
+}
+
+/* Recommended connections for a left-to-right arrangement:
+   - neighbouring displays of different computers connect both ways, without
+     switching the shared monitor; an edge that the OS layout leads onto the
+     shared monitor works while that monitor shows another computer;
+   - a display next to the shared monitor reaches the computer the monitor is
+     showing (same condition);
+   - the shared monitor's outer edge "flips" it to the other computer. */
+function recommendedLinks(M, order) {
   const links = Object.fromEntries(M.machines.map((m) => [m.name, []]));
   const disp = Object.fromEntries(M.displays.map((d) => [d.id, d]));
-  const own = order.map((id) => disp[id]).filter((d) => d && !d.shared);
-  for (let i = 0; i + 1 < own.length; i++) {
-    const L = own[i], R = own[i + 1];
-    if (L.machine === R.machine) continue;
-    links[L.machine].push({ edge: "right", peer: R.machine, screen: L.osName, to_screen: R.osName, to_edge: "left" });
-    links[R.machine].push({ edge: "left", peer: L.machine, screen: R.osName, to_screen: L.osName, to_edge: "right" });
+  const seq = order.map((id) => disp[id]).filter(Boolean);
+  const holders = M.shared ? M.machines.filter((m) => M.shared.names[m.name]) : [];
+  const add = (machine, l) => {
+    const st = edgeState(M, machine, l);
+    if (st.state === "blocked" && st.shared) l.when = "shared_shows_other";
+    if (edgeState(M, machine, l).state === "blocked") return; // the OS layout makes this edge impossible
+    links[machine].push(l);
+  };
+  for (let i = 0; i + 1 < seq.length; i++) {
+    const L = seq[i], R = seq[i + 1];
+    if (!L.shared && !R.shared) {
+      if (L.machine === R.machine) continue;
+      add(L.machine, { edge: "right", peer: R.machine, screen: L.osName, to_screen: R.osName, to_edge: "left", switch_monitor: false });
+      add(R.machine, { edge: "left", peer: L.machine, screen: R.osName, to_screen: L.osName, to_edge: "right", switch_monitor: false });
+    } else if (!L.shared || !R.shared) {
+      const D = L.shared ? R : L, dEdge = L.shared ? "left" : "right", sEdge = L.shared ? "right" : "left";
+      for (const h of holders) {
+        if (h.name === D.machine) continue;
+        add(D.machine, { edge: dEdge, peer: h.name, screen: D.osName, to_screen: M.core, to_edge: sEdge, switch_monitor: false, when: "shared_shows_other" });
+        add(h.name, { edge: sEdge, peer: D.machine, screen: M.core, to_screen: D.osName, to_edge: dEdge, switch_monitor: false });
+      }
+    }
   }
   if (M.shared) {
     const idx = order.indexOf("shared");
-    const edge = idx === order.length - 1 ? "right" : idx === 0 ? "left" : null;
-    if (edge) {
-      const holders = M.machines.filter((m) => M.shared.names[m.name]);
-      for (const m of holders) for (const o of holders) {
-        if (m === o) continue;
-        links[m.name].push({ edge, peer: o.name, screen: M.core, to_screen: M.core, to_edge: edge, dwell_ms: 250 });
-      }
+    const outer = idx === order.length - 1 ? "right" : idx === 0 ? "left" : null;
+    if (outer) for (const a of holders) for (const b of holders) if (a !== b) {
+      links[a.name].push({ edge: outer, peer: b.name, screen: M.core, to_screen: M.core, to_edge: outer, dwell_ms: 250, switch_monitor: true });
     }
   }
   return links;
 }
 
-/* Would this link ever fire, given the OS's own display layout? */
-function blockedBy(M, machineName, link) {
-  const m = M.byName[machineName];
-  if (!m) return null;
-  const seg = m.screens.find((s) => s.name.includes(link.screen));
-  if (!seg) return null;
-  const r = seg.rect;
-  const probe = { left: [r.x - 1, r.y + r.h / 2], right: [r.x + r.w, r.y + r.h / 2], top: [r.x + r.w / 2, r.y - 1], bottom: [r.x + r.w / 2, r.y + r.h] }[link.edge];
-  const hit = m.screens.find((s) => s !== seg && probe[0] >= s.rect.x && probe[0] < s.rect.x + s.rect.w && probe[1] >= s.rect.y && probe[1] < s.rect.y + s.rect.h);
-  return hit ? shortScreenName(hit.name) : null;
+/* Plain-language description of a connection. */
+function describeLink(M, machine, l) {
+  const scr = (m, s) => (isShared(M, s) ? shortScreenName(M.shared ? M.shared.name : s) : `${m}'s ${shortScreenName(s).toLowerCase()}`);
+  const flip = isShared(M, l.screen) && isShared(M, l.to_screen);
+  if (flip) return `Push off the ${l.edge} edge of the ${shortScreenName(M.shared.name)} to hand it, and the pointer, to ${l.peer}.`;
+  return `Leaving the ${l.edge} edge of ${scr(machine, l.screen)} arrives at the ${l.to_edge || "opposite"} edge of ${scr(l.peer, l.to_screen)} on ${l.peer}.`;
+}
+
+function startEditing() {
+  if (!S.plan) { S.plan = JSON.parse(JSON.stringify(allLinks())); S.savedPlan = JSON.parse(JSON.stringify(S.plan)); }
+}
+function planChanged() {
+  const changed = S.plan && JSON.stringify(S.plan) !== JSON.stringify(S.savedPlan);
+  $("#plan").hidden = !changed;
+  if (changed) {
+    const n = Object.values(S.plan).reduce((s, l) => s + l.length, 0);
+    $("#plan-text").textContent = `${n} connection${n === 1 ? "" : "s"}, not saved yet`;
+  }
 }
 
 /* ------------------------------------------------------------------ desk rendering */
@@ -179,7 +242,7 @@ function layoutDisplays(M, order, W, H) {
     const k = d.laptop ? 0.66 : 1;
     return { w: (d.rect.w / 2560) * 300 * k, h: (d.rect.h / 2560) * 300 * k };
   });
-  let gapSame = 16, gapOther = 70;
+  let gapSame = 16, gapOther = 130;
   let total = 0;
   items.forEach((d, i) => {
     total += sizes[i].w;
@@ -218,7 +281,7 @@ function render() {
 
   // Cables underneath the displays.
   const cablesLayer = el("g", {}, desk);
-  const links = currentLinks(M);
+  const links = allLinks();
   drawCables(M, L, links, cablesLayer, machineColor);
 
   // Displays.
@@ -235,58 +298,92 @@ function render() {
   // Hint text.
   $("#desk-hint").textContent = M.machines.length < 2
     ? "Start Switchboard on your other computer. It will appear here."
-    : "Drag displays to match your desk. The cables show where the pointer crosses.";
+    : "Drag screens to match your desk. Drag from a jack on a screen's edge to connect it to another computer.";
 }
 
-function currentLinks(M) {
-  if (S.plan) return S.plan;
-  // Show this computer's configured links (they describe both directions visually).
-  const me = M.machines[0].name;
-  return { [me]: (S.status.links || []).map((l) => ({ ...l })) };
-}
+function currentLinks() { return allLinks(); }
 
 function findBox(M, L, machine, screenSub) {
   if (!screenSub) return null;
-  if (M.shared && (screenSub === M.core || (M.shared.names[machine] || "").includes(screenSub) && Object.values(M.shared.names).some((n) => n.includes(screenSub)) && M.core && screenSub.includes(M.core))) return L.boxes.shared;
+  if (isShared(M, screenSub)) return L.boxes.shared || null;
   const d = M.displays.find((x) => x.machine === machine && x.osName.includes(screenSub));
-  if (d) return L.boxes[d.id];
-  if (M.shared && Object.values(M.shared.names).some((n) => n.includes(screenSub))) return L.boxes.shared;
-  return null;
+  return d ? L.boxes[d.id] : null;
 }
 
+const edgeX = (b, edge) => (edge === "left" ? b.x : b.x + b.w);
+
 function drawCables(M, L, links, layer, color) {
-  const seen = new Set();
+  // Count connections per unordered display pair so opposite directions sit side by side.
+  const pairKey = (a, b) => [a, b].sort().join("|");
+  const counts = {};
+  for (const [machine, ls] of Object.entries(links)) for (const l of ls) {
+    const a = findBox(M, L, machine, l.screen), b = findBox(M, L, l.peer, l.to_screen);
+    if (a && b && a !== b) counts[pairKey(a.d.id, b.d.id)] = (counts[pairKey(a.d.id, b.d.id)] || 0) + 1;
+  }
+  const used = {};
   for (const [machine, ls] of Object.entries(links)) {
-    for (const l of ls) {
+    ls.forEach((l, li) => {
       const a = findBox(M, L, machine, l.screen);
       const b = findBox(M, L, l.peer, l.to_screen);
-      if (!a) continue;
-      const key = [a.d.id, b ? b.d.id : "?", l.edge].sort().join("|");
-      if (seen.has(key) && a !== b) continue;
-      seen.add(key);
-      const ay = a.y + a.h * 0.55;
-      const ax = l.edge === "left" ? a.x : a.x + a.w;
-      let d;
+      if (!a) return;
+      const st = edgeState(M, machine, l);
+      const col = st.state === "blocked" ? "var(--coral)" : color(machine);
+      let d, end, tangent;
+      const ax = edgeX(a, l.edge);
       if (!b || a === b) {
-        // Flip: a loop off the outer edge of the shared monitor.
+        // Flip: a loop off the outer edge, one loop per computer, stacked.
+        const k = (used["flip" + a.d.id] = (used["flip" + a.d.id] || 0) + 1) - 1;
         const dir = l.edge === "left" ? -1 : 1;
-        d = `M ${ax} ${ay} c ${dir * 70} -50, ${dir * 90} 70, ${dir * 4} 56`;
+        const ay = a.y + a.h * (0.38 + k * 0.26);
+        const by = ay + a.h * 0.18;
+        d = `M ${ax} ${ay} c ${dir * (64 + k * 18)} -26, ${dir * (64 + k * 18)} ${by - ay + 26}, ${dir * 6} ${by - ay}`;
+        end = [ax + dir * 6, by];
+        tangent = [-dir, 0];
       } else {
+        const key = pairKey(a.d.id, b.d.id);
+        const n = counts[key] || 1, k = (used[key] = (used[key] || 0) + 1) - 1;
+        const off = (k - (n - 1) / 2) * 18;
+        const ay = a.y + a.h * 0.55 + off;
         const bx = l.to_edge === "left" ? b.x : l.to_edge === "right" ? b.x + b.w : b.x + b.w / 2;
-        const by = b.y + b.h * 0.55;
-        const sag = Math.max(46, Math.abs(bx - ax) * 0.45);
-        d = `M ${ax} ${ay} C ${ax + (l.edge === "left" ? -30 : 30)} ${ay + sag}, ${bx + (l.to_edge === "left" ? -30 : 30)} ${by + sag}, ${bx} ${by}`;
+        const by = b.y + b.h * 0.55 + off;
+        const sag = Math.max(40, Math.abs(bx - ax) * 0.4) + off * 0.6;
+        const c1x = ax + (l.edge === "left" ? -34 : 34), c2x = bx + (l.to_edge === "left" ? -34 : 34);
+        d = `M ${ax} ${ay} C ${c1x} ${ay + sag}, ${c2x} ${by + sag}, ${bx} ${by}`;
+        end = [bx, by];
+        const tx = bx - c2x, ty = by - (by + sag), len = Math.hypot(tx, ty) || 1;
+        tangent = [tx / len, ty / len];
       }
-      const blocked = blockedBy(M, machine, l);
-      const path = el("path", { d, class: "cable" + (blocked ? " blocked" : ""), stroke: color(machine) }, layer);
+      const path = el("path", { d, class: "cable" + (st.state === "blocked" ? " blocked" : "") + (st.state === "conditional" ? " conditional" : ""), stroke: col }, layer);
       path.dataset.machine = machine;
+      // Arrowhead at the destination.
+      const [ex, ey] = end, [tx, ty] = tangent;
+      const s = 9, px = -ty, py = tx;
+      el("path", { d: `M ${ex} ${ey} L ${ex - tx * s + px * s * 0.55} ${ey - ty * s + py * s * 0.55} L ${ex - tx * s - px * s * 0.55} ${ey - ty * s - py * s * 0.55} Z`, fill: col, class: "arrow" }, layer);
+      el("circle", { cx: ax, cy: Number(d.split(" ")[2]), r: 5, class: "jack", fill: "var(--brass)" }, layer);
+      if (st.state === "conditional") {
+        // Small monitor badge: "only while the shared monitor shows the other computer".
+        const mid = path.getPointAtLength(path.getTotalLength() * 0.5);
+        const g = el("g", { transform: `translate(${mid.x - 9},${mid.y - 7})`, class: "badge" }, layer);
+        el("rect", { x: 0, y: 0, width: 18, height: 12, rx: 2.5 }, g);
+        el("rect", { x: 7, y: 12, width: 4, height: 3 }, g);
+      }
       const hit = el("path", { d, class: "cable-hit" }, layer);
-      hit.addEventListener("click", (e) => { e.stopPropagation(); select({ kind: "link", machine, link: l }); });
-      const jack = (x, y) => el("circle", { cx: x, cy: y, r: 5.5, class: "jack", fill: "var(--brass)" }, layer);
-      jack(ax, ay);
-      if (b && a !== b) jack(l.to_edge === "left" ? b.x : b.x + b.w, b.y + b.h * 0.55);
-      else jack(ax + (l.edge === "left" ? -4 : 4), ay + 56);
-    }
+      const sel = S.sel && S.sel.kind === "link" && S.sel.machine === machine && S.sel.index === li;
+      if (sel) path.classList.add("sel");
+      hit.addEventListener("click", (e) => { e.stopPropagation(); select({ kind: "link", machine, index: li }); });
+    });
+  }
+}
+
+/* Edge jacks: drag from one to another computer's display to connect. */
+function drawJacks(M, b, g) {
+  if (M.machines.length < 2) return;
+  for (const edge of ["left", "right"]) {
+    const x = edge === "left" ? 0 : b.w;
+    const j = el("circle", { cx: x, cy: b.h * 0.55, r: 7, class: "edge-jack", tabindex: -1 }, g);
+    const t = el("title", {}, j);
+    t.textContent = `Drag to connect the ${edge} edge to another computer`;
+    j.addEventListener("pointerdown", (e) => { e.stopPropagation(); startConnect(e, b, edge); });
   }
 }
 
@@ -331,6 +428,7 @@ function drawDisplay(M, b, color) {
     sub.textContent = m ? (m.me ? `This ${friendlyOs(m.os)} computer` : `${friendlyOs(m.os)} computer`) : "";
     sub.style.fill = m ? m.color : "";
   }
+  drawJacks(M, b, g);
   // Interaction: select + drag to reorder.
   g.addEventListener("pointerdown", (e) => startDrag(e, d.id, g, b));
   g.addEventListener("keydown", (e) => {
@@ -365,17 +463,22 @@ function drawPeripherals(M, L, color) {
   el("line", { x1: 88, y1: 4, x2: 88, y2: 18, stroke: "var(--line)", "stroke-width": 1.2 }, g);
 }
 
-/* ------------------------------------------------------------------ drag to arrange */
+/* ------------------------------------------------------------------ drag: arrange displays, draw connections */
 let drag = null;
+function svgPoint(e) {
+  const r = desk.getBoundingClientRect(), vb = desk.viewBox.baseVal;
+  return [((e.clientX - r.left) / r.width) * vb.width, ((e.clientY - r.top) / r.height) * vb.height];
+}
+
 function startDrag(e, id, g, box) {
   if (e.button !== 0) return;
-  drag = { id, g, box, x0: e.clientX, moved: false };
+  drag = { kind: "move", id, g, box, x0: e.clientX, moved: false };
   g.setPointerCapture(e.pointerId);
   g.addEventListener("pointermove", onDrag);
   g.addEventListener("pointerup", endDrag, { once: true });
 }
 function onDrag(e) {
-  if (!drag) return;
+  if (!drag || drag.kind !== "move") return;
   const dx = (e.clientX - drag.x0) * (desk.viewBox.baseVal.width / desk.clientWidth);
   if (Math.abs(dx) > 4) drag.moved = true;
   if (!drag.moved) return;
@@ -403,30 +506,77 @@ function nudge(id, dir) {
   [o[i], o[j]] = [o[j], o[i]];
   reorder(o);
 }
+/* Arranging only changes the picture (and the recommended connections);
+   it never rewires anything by itself. */
 function reorder(order) {
-  if (order.join() === S.order.join()) { render(); return; }
-  if (!S.savedOrder) S.savedOrder = S.order.slice();
   S.order = order;
-  const M = buildModel();
-  S.plan = planLinks(M, order);
-  const n = Object.values(S.plan).reduce((s, l) => s + l.length, 0);
-  $("#plan-text").textContent = n ? `${n} crossing${n === 1 ? "" : "s"} for this arrangement` : "No crossings in this arrangement";
-  $("#plan").hidden = false;
+  try { localStorage.setItem("desk-order", JSON.stringify(order)); } catch (_) { /* ignore */ }
   render();
 }
+
+/* Drag from an edge jack to another computer's display. */
+function startConnect(e, box, edge) {
+  const [x0, y0] = [edgeX(box, edge), box.y + box.h * 0.55];
+  const rubber = el("path", { class: "rubber", d: "" }, desk);
+  const move = (ev) => {
+    const [x, y] = svgPoint(ev);
+    rubber.setAttribute("d", `M ${x0} ${y0} C ${x0 + (edge === "left" ? -40 : 40)} ${y0 + 50}, ${x} ${y + 50}, ${x} ${y}`);
+  };
+  const up = (ev) => {
+    window.removeEventListener("pointermove", move);
+    rubber.remove();
+    const [x] = svgPoint(ev);
+    const hit = document.elementFromPoint(ev.clientX, ev.clientY);
+    const g = hit && hit.closest && hit.closest(".disp");
+    if (!g) return;
+    const target = geom.boxes[g.dataset.id];
+    if (!target) return;
+    const toEdge = x < target.x + target.w / 2 ? "left" : "right";
+    addConnection(box.d, edge, target.d, toEdge);
+  };
+  window.addEventListener("pointermove", move);
+  window.addEventListener("pointerup", up, { once: true });
+  move(e);
+}
+
+function addConnection(src, edge, dst, toEdge) {
+  const M = buildModel();
+  const holders = (d) => (d.shared ? M.machines.filter((m) => d.names[m.name]).map((m) => m.name) : [d.machine]);
+  const screenOf = (d) => (d.shared ? M.core : d.osName);
+  const pairs = [];
+  for (const a of holders(src)) for (const b of holders(dst)) if (a !== b) pairs.push([a, b]);
+  if (!pairs.length) {
+    toast(`Both are ${src.machine || dst.machine}'s displays. Moving between them is handled by its own display settings.`);
+    return;
+  }
+  startEditing();
+  for (const [a, b] of pairs) {
+    const l = { edge, peer: b, screen: screenOf(src), to_screen: screenOf(dst), to_edge: toEdge, switch_monitor: !!dst.shared };
+    if (src.shared && dst.shared) l.dwell_ms = 250;
+    const st = edgeState(M, a, l);
+    if (st.state === "blocked" && st.shared) l.when = "shared_shows_other";
+    // Replace an existing connection from the same edge of the same screen.
+    S.plan[a] = (S.plan[a] || []).filter((x) => !(x.edge === l.edge && x.screen === l.screen && x.peer === l.peer));
+    S.plan[a].push(l);
+    S.sel = { kind: "link", machine: a, index: S.plan[a].length - 1 };
+  }
+  planChanged();
+  render();
+  renderInspector();
+}
+
 $("#plan-reset").addEventListener("click", () => {
-  S.order = S.savedOrder || S.order; S.savedOrder = null; S.plan = null; $("#plan").hidden = true; render();
+  S.plan = null; S.savedPlan = null; S.sel = null; $("#plan").hidden = true; render(); renderInspector();
 });
 $("#plan-apply").addEventListener("click", async () => {
   const M = buildModel();
   const me = M.machines[0].name;
-  const peers = M.machines.slice(1).map((m) => ({ name: m.name, links: (S.plan[m.name] || []) }));
+  const peers = M.machines.slice(1).map((m) => ({ name: m.name, links: S.plan[m.name] || [] }));
   const r = await sb.call({ cmd: "layout", links: S.plan[me] || [], peers });
-  if (r.ok === false) { toast(r.error || "Couldn't save the arrangement."); return; }
-  try { localStorage.setItem("desk-order", JSON.stringify(S.order)); } catch (_) { /* ignore */ }
-  S.plan = null; S.savedOrder = null; $("#plan").hidden = true;
-  toast("Arrangement saved on all computers.");
-  refresh();
+  if (r.ok === false) { toast(r.error || "Couldn't save the connections."); return; }
+  S.plan = null; S.savedPlan = null; $("#plan").hidden = true;
+  toast("Connections saved on both computers.");
+  setTimeout(refresh, 400);
 });
 
 /* ------------------------------------------------------------------ inspector */
@@ -447,8 +597,8 @@ function renderInspector() {
     if (d && d.shared) return box.replaceChildren(sharedPanel(M, d));
     if (d) return box.replaceChildren(machinePanel(M, M.byName[d.machine], d));
   }
-  if (sel && sel.kind === "link") return box.replaceChildren(linkPanel(M, sel.machine, sel.link));
-  box.replaceChildren(overviewPanel(M));
+  if (sel && sel.kind === "link") return box.replaceChildren(linkPanel(M, sel.machine, sel.index));
+  box.replaceChildren(bindOverview(overviewPanel(M), M));
 }
 
 function rttBlock(p) {
@@ -467,6 +617,9 @@ function overviewPanel(M) {
     <h2>${peer ? `${esc(M.machines[0].name)} and ${esc(peer.name)}` : esc(M.machines[0].name)}</h2>
     <p class="kind">${peer ? (M.focus === M.machines[0].name ? "The pointer is on this computer." : `The pointer is on ${esc(M.focus)}.`) : "Waiting for your other computer."}</p>
     ${peer ? rttBlock(peer.peer) : `<div class="note">Install and open Switchboard on the other computer. When it's on the same network it shows up at the top of the desk, ready to pair.</div>`}
+    ${peer ? `<h3>Connections</h3>
+    <p class="muted">Each cable is one way: the pointer leaves where the jack is and arrives at the arrow. Drag from a jack on a screen's edge to another computer's screen to add one; click a cable to change it.</p>
+    <div class="actions"><button class="quiet" data-act="recommend">Use recommended connections</button></div>` : ""}
     <h3>Moving between computers</h3>
     <ul class="tips">
       <li>Push the pointer through a cabled edge.</li>
@@ -480,6 +633,18 @@ function overviewPanel(M) {
       <dt>Switches</dt><dd>${st.stats.switches}</dd>
       <dt>Memory</dt><dd>${(st.stats.rss_bytes / 1048576).toFixed(1)} MB</dd>
     </dl>`);
+}
+
+function bindOverview(frag, M) {
+  frag.querySelector('[data-act="recommend"]')?.addEventListener("click", () => {
+    startEditing();
+    S.plan = recommendedLinks(M, S.order);
+    S.sel = null;
+    planChanged();
+    render();
+    renderInspector();
+  });
+  return frag;
 }
 
 function machinePanel(M, m, d) {
@@ -532,17 +697,51 @@ function sharedPanel(M, d) {
   return frag;
 }
 
-function linkPanel(M, machine, l) {
-  const blocked = blockedBy(M, machine, l);
-  const flip = l.to_screen && l.screen && l.screen === l.to_screen;
-  const scr = (s) => esc(shortScreenName(s || ""));
-  return h(`
+function linkPanel(M, machine, index) {
+  const l = (allLinks()[machine] || [])[index];
+  if (!l) return overviewPanel(M);
+  const st = edgeState(M, machine, l);
+  const flip = isShared(M, l.screen) && isShared(M, l.to_screen);
+  const mon = M.shared ? shortScreenName(M.shared.name) : null;
+  const nearShared = st.by && isShared(M, (beyond(M, machine, l.screen, l.edge) || {}).name);
+  const frag = h(`
     <h2>${flip ? "Monitor flip" : `${esc(machine)} to ${esc(l.peer)}`}</h2>
-    <p class="kind">${flip ? `Push off the ${l.edge} edge of the ${scr(l.screen)} to hand it to ${esc(l.peer)}.` : `Leaving the ${l.edge} edge of ${scr(l.screen)} arrives at the ${esc(l.to_edge || "")} edge of ${scr(l.to_screen)}.`}</p>
-    <dl class="facts">
-      <dt>Hold time</dt><dd>${l.dwell_ms ? `${l.dwell_ms} ms against the edge` : "Immediate"}</dd>
-    </dl>
-    ${blocked ? `<div class="note warn">${esc(friendlyOs(M.byName[machine].os))} places ${esc(blocked)} beyond this edge, so the pointer can't cross here. Rearrange the displays in ${esc(friendlyOs(M.byName[machine].os))}'s settings, or use the monitor flip.</div>` : ""}`);
+    <p class="kind">${esc(describeLink(M, machine, l))}</p>
+    ${st.state === "conditional" ? `<div class="note">Works while the ${esc(mon)} shows another computer. While it shows ${esc(machine)}, the pointer moves onto it instead, because ${esc(friendlyOs(M.byName[machine].os))} places it beyond this edge.</div>` : ""}
+    ${st.state === "blocked" ? `<div class="note warn">${esc(friendlyOs(M.byName[machine].os))} places ${esc(st.by)} beyond this edge, so the pointer can't leave here${nearShared ? `. Turn on "Only while the ${esc(mon)} shows another computer" to use it whenever the ${esc(mon)} isn't showing ${esc(machine)}.` : `. Rearrange the displays in ${esc(friendlyOs(M.byName[machine].os))}'s settings, or use another edge.`}</div>` : ""}
+    ${M.shared ? `<div class="row"><div><div class="t">Switch the ${esc(mon)} to ${esc(l.peer)}</div><div class="d">Off: the monitor keeps showing whatever it shows now.</div></div>
+      <label class="switch"><input type="checkbox" data-k="switch_monitor" ${l.switch_monitor !== false ? "checked" : ""}></label></div>` : ""}
+    ${M.shared && (nearShared || l.when) ? `<div class="row"><div><div class="t">Only while the ${esc(mon)} shows another computer</div><div class="d">Lets this edge cross over when the monitor beyond it isn't showing ${esc(machine)}.</div></div>
+      <label class="switch"><input type="checkbox" data-k="when" ${l.when === "shared_shows_other" ? "checked" : ""}></label></div>` : ""}
+    <div class="row"><div><div class="t">Hold against the edge</div><div class="d">Guards against crossing by accident.</div></div>
+      <div style="display:flex;align-items:center;gap:10px"><input type="range" min="0" max="600" step="50" value="${l.dwell_ms || 0}" data-k="dwell_ms"><span class="range-val">${l.dwell_ms ? l.dwell_ms + " ms" : "Off"}</span></div></div>
+    <div class="actions"><button class="ghost" data-act="delete">Delete connection</button></div>`);
+  const edit = (fn) => {
+    startEditing();
+    const t = S.plan[machine][index];
+    fn(t);
+    planChanged();
+    render();
+    renderInspector();
+  };
+  frag.querySelectorAll("[data-k]").forEach((inp) => {
+    const k = inp.dataset.k;
+    if (inp.type === "range") inp.addEventListener("input", () => { inp.nextElementSibling.textContent = inp.value > 0 ? inp.value + " ms" : "Off"; });
+    inp.addEventListener("change", () => edit((t) => {
+      if (k === "switch_monitor") t.switch_monitor = inp.checked;
+      if (k === "when") { if (inp.checked) t.when = "shared_shows_other"; else delete t.when; }
+      if (k === "dwell_ms") { const v = Number(inp.value); if (v > 0) t.dwell_ms = v; else delete t.dwell_ms; }
+    }));
+  });
+  frag.querySelector('[data-act="delete"]').addEventListener("click", () => {
+    startEditing();
+    S.plan[machine].splice(index, 1);
+    S.sel = null;
+    planChanged();
+    render();
+    renderInspector();
+  });
+  return frag;
 }
 
 /* ------------------------------------------------------------------ settings */
@@ -690,8 +889,8 @@ async function refresh() {
   else {
     const flash = S.lastSwitches != null && st.stats.switches !== S.lastSwitches;
     S.lastSwitches = st.stats.switches;
-    const changed = JSON.stringify([st.mode, st.focus, st.links, st.screens, (st.peers || []).map((p) => [p.name, p.trusted, p.screens, p.monitor_input]), st.monitor && st.monitor.observed, st.disabled]) !== refresh.sig;
-    refresh.sig = JSON.stringify([st.mode, st.focus, st.links, st.screens, (st.peers || []).map((p) => [p.name, p.trusted, p.screens, p.monitor_input]), st.monitor && st.monitor.observed, st.disabled]);
+    const changed = JSON.stringify([st.mode, st.focus, st.links, st.screens, (st.peers || []).map((p) => [p.name, p.trusted, p.screens, p.monitor_input, p.links]), st.monitor && st.monitor.observed, st.disabled]) !== refresh.sig;
+    refresh.sig = JSON.stringify([st.mode, st.focus, st.links, st.screens, (st.peers || []).map((p) => [p.name, p.trusted, p.screens, p.monitor_input, p.links]), st.monitor && st.monitor.observed, st.disabled]);
     S.status = st; S.offline = false;
     if (changed && !drag) render();
     if (flash) document.querySelectorAll(".cable").forEach((c) => { c.classList.remove("hot"); void c.getBBox(); c.classList.add("hot"); });

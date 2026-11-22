@@ -332,6 +332,9 @@ pub enum Ctrl {
         /// Shared-monitor model substring and the input this machine is on.
         monitor_model: String,
         monitor_input: Option<u16>,
+        /// The sender's connections (so every app can show every direction).
+        #[serde(default)]
+        links: Vec<crate::config::Link>,
     },
     /// Sent when the peer is not yet trusted; carries nothing – the SAS is
     /// derived independently on both sides from the handshake hash.
@@ -361,7 +364,11 @@ pub enum Ctrl {
         to_screen: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         to_edge: Option<Edge>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        switch_monitor: Option<bool>,
     },
+    /// The shared monitor now shows `input` (sent by whoever switched it).
+    MonitorShows { input: u16 },
     /// Source -> sink: control revoked (manual switch / emergency / shutdown).
     /// Sink must release all buttons.
     Revoke { epoch: u32 },

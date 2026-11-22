@@ -80,6 +80,7 @@ struct Inner {
     remote: Option<RemoteFn>,
     /// Called when the input changed without us (e.g. the monitor's own buttons).
     on_manual: Option<ManualFn>,
+    on_switched: Option<ManualFn>,
     last_switch: Option<Instant>,
 }
 
@@ -92,7 +93,7 @@ pub struct Coordinator {
 impl Coordinator {
     pub fn new(model: String, local_input: Option<u16>) -> Coordinator {
         let c = Coordinator {
-            inner: Arc::new((Mutex::new(Inner { desired: None, status: MonitorStatus { model, local_input, ..Default::default() }, remote: None, on_manual: None, last_switch: None }), Condvar::new())),
+            inner: Arc::new((Mutex::new(Inner { desired: None, status: MonitorStatus { model, local_input, ..Default::default() }, remote: None, on_manual: None, on_switched: None, last_switch: None }), Condvar::new())),
         };
         let c2 = c.clone();
         std::thread::Builder::new().name("sb-monitor".into()).spawn(move || c2.run()).expect("spawn monitor thread");
@@ -107,6 +108,18 @@ impl Coordinator {
     /// Watching costs a DDC read every 1.5 s; only do it when someone listens.
     pub fn watching(&self) -> bool {
         self.inner.0.lock().unwrap().on_manual.is_some()
+    }
+
+    pub fn set_on_switched(&self, f: Option<ManualFn>) {
+        self.inner.0.lock().unwrap().on_switched = f;
+    }
+
+    /// A peer switched the monitor: record it so the watcher does not mistake
+    /// it for a manual change.
+    pub fn set_observed(&self, input: u16) {
+        let mut g = self.inner.0.lock().unwrap();
+        g.status.observed = Some(input & 0xff);
+        g.last_switch = Some(Instant::now());
     }
 
     pub fn set_on_manual(&self, f: Option<ManualFn>) {
@@ -184,6 +197,9 @@ impl Coordinator {
             g.last_switch = Some(Instant::now());
             if res.is_ok() {
                 g.status.observed = Some(target);
+                if let Some(f) = &g.on_switched {
+                    f(target);
+                }
             }
             g.status.last_target = Some(target);
             g.status.last_ms = Some(ms);

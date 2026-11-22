@@ -127,7 +127,15 @@ button.icon svg { width: 18px; height: 18px; fill: none; stroke: currentColor; s
 .disp .port.live { fill: var(--ink); }
 
 .cable { fill: none; stroke-width: 3.2; stroke-linecap: round; opacity: .9; transition: opacity .3s; }
-.cable.blocked { stroke-dasharray: 2 7; opacity: .55; }
+.cable.blocked { stroke-dasharray: 2 7; opacity: .7; }
+.cable.conditional { stroke-dasharray: 10 5; }
+.cable.sel { stroke-width: 5.5; opacity: 1; }
+.arrow { pointer-events: none; }
+.badge rect { fill: var(--surface); stroke: currentColor; stroke-width: 1.4; color: var(--ink-2); }
+.edge-jack { fill: var(--brass); stroke: var(--bezel); stroke-width: 2; opacity: 0; cursor: crosshair; transition: opacity .15s; }
+.disp:hover .edge-jack, .disp:focus-within .edge-jack { opacity: .95; }
+.edge-jack:hover { r: 9; }
+.rubber { fill: none; stroke: var(--brass); stroke-width: 3; stroke-dasharray: 6 6; pointer-events: none; }
 .cable.hot { animation: hot 1.2s ease-out 1; }
 @keyframes hot { 0% { stroke-width: 7; opacity: 1; } 100% { stroke-width: 3.2; opacity: .9; } }
 .jack { stroke: var(--bezel); stroke-width: 2; }

@@ -115,7 +115,7 @@ pub fn handle(e: &Arc<Engine>, req: Value) -> Value {
                         }
                         let to_screen = s("to_screen");
                         let to_edge = serde_json::from_value(req["to_edge"].clone()).ok();
-                        c.links.push(crate::config::Link { edge, peer: peer.clone(), screen, to_screen, to_edge, dwell_ms: req["dwell_ms"].as_u64() });
+                        c.links.push(crate::config::Link { edge, peer: peer.clone(), screen, to_screen, to_edge, dwell_ms: req["dwell_ms"].as_u64(), switch_monitor: req["switch_monitor"].as_bool(), when: s("when") });
                         let _ = c.save();
                     }
                     e.reload_config();

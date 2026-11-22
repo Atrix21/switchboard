@@ -52,6 +52,14 @@ pub struct Link {
     /// switching (guards gestures that are costly to trigger by accident).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dwell_ms: Option<u64>,
+    /// Switch the shared monitor to the destination computer (default: yes).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub switch_monitor: Option<bool>,
+    /// Condition: "shared_shows_other" = only while the shared monitor shows
+    /// another computer. While active, the shared monitor's own screen beyond
+    /// this edge (invisible at that moment) does not block the crossing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub when: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

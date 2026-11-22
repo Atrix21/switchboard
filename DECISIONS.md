@@ -57,10 +57,16 @@ Each record states the decision, the evidence, and what was rejected. Records ma
 3. Engine-level dead-forwarding detection and a keyboard acknowledgement watchdog.
 4. `switchboard selftest` drives the real hook path with tagged synthetic input; the deploy script refuses to ship if it fails.
 
-## ADR-10: Shared-monitor topology
+## ADR-10: Shared-monitor topology and user-chosen connections (*revised*)
 
-**Context.** Physical desk, left to right: Ubuntu laptop, Windows laptop, shared Alienware. Each OS places the Alienware next to its own panel, so no single edge layout matches the desk while the monitor follows focus.
-**Decision.** Links can name a landing display and edge (`to_screen`, `to_edge`) and several links per peer are allowed. The desk planner generates crossings between adjacent physical displays, plus a "flip" at the shared monitor's outer edge (land on the same edge of the same physical monitor) guarded by a 250 ms dwell. Edges that an OS's own layout blocks are detected and shown as dashed with an explanation. Arriving on an edge disarms it until the pointer leaves it (no bounce-back).
+**Context.** Physical desk, left to right: Ubuntu laptop, Windows laptop, shared Alienware. Each OS places the Alienware next to its own panel, so "right of the Ubuntu laptop" means two different things depending on which computer the Alienware is showing.
+**First version.** The monitor always followed the pointer; Ubuntu could only return to Windows through the Alienware flip. The desk view drew one cable between the laptops, which read as two-way. The user found this confusing.
+**Decision (chosen by the user).**
+- Connections are one-way, drawn with arrows, and **chosen by the user in the app** (drag from an edge jack to another computer's screen; click a cable to edit or delete it). "Use recommended connections" restores the default.
+- Per connection: **switch the shared monitor or not**, **hold time**, and the condition **"only while the shared monitor shows another computer"**. While that condition holds, the shared monitor's screen beyond the edge (invisible at that moment) doesn't block the crossing. Computers announce every monitor switch (`MonitorShows`), so the condition is evaluated on current information on both sides.
+- Recommended default for this desk: laptops are neighbours both ways and don't switch the monitor; the Windows laptop's right edge reaches Ubuntu's Alienware while it shows Ubuntu; the Alienware's outer edge flips it (switches the monitor, 250 ms hold).
+- Edges that an OS layout makes impossible are drawn dashed red with an explanation; conditional ones are dashed with a monitor badge. Arriving on an edge disarms it until the pointer leaves it (no bounce-back).
+- Every computer's connections travel in its Hello, so each app shows every direction truthfully.
 
 ## ADR-11: Desktop app = system web view, separate process
 
