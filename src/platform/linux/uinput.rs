@@ -164,6 +164,9 @@ impl Injector for UinputInjector {
     fn cursor_pos(&mut self) -> Option<(i32, i32)> {
         self.x.cursor_pos()
     }
+    fn set_cursor_visible(&mut self, visible: bool) {
+        self.x.set_cursor_visible(visible);
+    }
     fn key(&mut self, code: u16, down: bool) -> io::Result<()> {
         self.flush()?;
         self.x.key(code, down)?;

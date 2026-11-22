@@ -345,9 +345,61 @@ impl Drop for WinCapture {
     }
 }
 
+/// A tiny, nearly transparent topmost window that sits under the parked
+/// cursor while forwarding and gives it an empty shape, so no frozen cursor
+/// is left on this screen. Nothing global changes: if the process dies the
+/// window goes with it and the cursor is back.
+unsafe extern "system" fn cloak_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    match msg {
+        WM_SETCURSOR => {
+            SetCursor(null_mut());
+            1
+        }
+        WM_MOUSEACTIVATE => MA_NOACTIVATE as LRESULT,
+        _ => DefWindowProcW(hwnd, msg, wp, lp),
+    }
+}
+
+unsafe fn create_cloak() -> HWND {
+    let hinst = GetModuleHandleW(null());
+    let cls = wide("SwitchboardCloak");
+    let wc = WNDCLASSW { lpfnWndProc: Some(cloak_proc), hInstance: hinst, lpszClassName: cls.as_ptr(), hCursor: null_mut(), ..zeroed() };
+    RegisterClassW(&wc);
+    let h = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE, cls.as_ptr(), cls.as_ptr(), WS_POPUP, 0, 0, 48, 48, null_mut(), null_mut(), hinst, null());
+    if !h.is_null() {
+        SetLayeredWindowAttributes(h, 0, 1, LWA_ALPHA);
+    }
+    h
+}
+
+unsafe fn show_cloak(h: HWND, on: bool) {
+    if h.is_null() {
+        return;
+    }
+    if on {
+        let (x, y) = (PARK_X.load(Ordering::Relaxed), PARK_Y.load(Ordering::Relaxed));
+        SetWindowPos(h, HWND_TOPMOST, x - 24, y - 24, 48, 48, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        // Nudge the cursor so Windows asks the window under it for a shape now.
+        SetCursorPos(x + 1, y);
+        SetCursorPos(x, y);
+    } else {
+        ShowWindow(h, SW_HIDE);
+    }
+}
+
+/// Is the cursor currently hidden (diagnostics / selftest)?
+pub fn cursor_hidden() -> bool {
+    unsafe {
+        let mut ci: CURSORINFO = zeroed();
+        ci.cbSize = size_of::<CURSORINFO>() as u32;
+        GetCursorInfo(&mut ci) != 0 && (ci.hCursor.is_null() || ci.flags & CURSOR_SHOWING == 0)
+    }
+}
+
 fn hook_thread(ready: mpsc::Sender<u32>) {
     unsafe {
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+        let cloak = create_cloak();
         let mut msg: MSG = zeroed();
         // Force creation of the thread message queue before announcing the id.
         PeekMessageW(&mut msg, null_mut(), WM_USER, WM_USER, PM_NOREMOVE);
@@ -370,13 +422,19 @@ fn hook_thread(ready: mpsc::Sender<u32>) {
                     hook = SetWindowsHookExW(WH_MOUSE_LL, Some(ll_mouse_proc), GetModuleHandleW(null()), 0);
                     if hook.is_null() {
                         log::error!("SetWindowsHookExW failed: {}", io::Error::last_os_error());
+                    } else {
+                        show_cloak(cloak, true);
                     }
                 }
                 WM_APP_HOOK_OFF if !hook.is_null() => {
                     UnhookWindowsHookEx(hook);
                     hook = null_mut();
+                    show_cloak(cloak, false);
                 }
-                _ => {}
+                _ => {
+                    TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
             }
         }
         if !hook.is_null() {
@@ -709,6 +767,7 @@ pub fn selftest() -> Result<String, String> {
             return Err(format!("cursor moved locally while forwarding ({park:?} -> {:?})", cursor()));
         }
         report.push("local cursor stayed parked (input blocked locally)".into());
+        report.push(format!("cursor hidden while forwarding: {}", cursor_hidden()));
         Ok(())
     })();
     cap.set_keyboard_forwarding(false);

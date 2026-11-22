@@ -843,6 +843,10 @@ impl Engine {
             return;
         }
         st.focus = new.clone();
+        // The pointer is on another computer and we're not the one driving it:
+        // hide our idle cursor so it doesn't sit frozen on this screen.
+        let elsewhere = new.is_some() && matches!(st.mode, Mode::Local);
+        self.inj.lock().unwrap().set_cursor_visible(!elsewhere);
         let follow = self.cfg.read().unwrap().keyboard.follow_pointer;
         // Release everything at the old target.
         if st.kb.target.is_some() {

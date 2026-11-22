@@ -103,6 +103,7 @@ pub struct XTestInjector {
     c: RustConnection,
     root: xproto::Window,
     wheel: WheelAcc,
+    hidden: bool,
 }
 
 fn x_button(b: Button) -> u8 {
@@ -119,7 +120,7 @@ impl XTestInjector {
     pub fn new() -> io::Result<Self> {
         let (c, root) = connect()?;
         c.extension_information(x11rb::protocol::xtest::X11_EXTENSION_NAME).map_err(xerr)?.ok_or_else(|| xerr("XTEST extension missing"))?;
-        Ok(XTestInjector { c, root, wheel: WheelAcc::default() })
+        Ok(XTestInjector { c, root, wheel: WheelAcc::default(), hidden: false })
     }
     fn click(&self, btn: u8) -> io::Result<()> {
         self.c.xtest_fake_input(xproto::BUTTON_PRESS_EVENT, btn, 0, NONE, 0, 0, 0).map_err(xerr)?;
@@ -161,6 +162,21 @@ impl Injector for XTestInjector {
     fn cursor_pos(&mut self) -> Option<(i32, i32)> {
         let r = self.c.query_pointer(self.root).ok()?.reply().ok()?;
         Some((r.root_x as i32, r.root_y as i32))
+    }
+    fn set_cursor_visible(&mut self, visible: bool) {
+        use x11rb::protocol::xfixes::ConnectionExt as _;
+        if visible == !self.hidden {
+            return;
+        }
+        // XFixes hide/show is per client and undone automatically if we exit.
+        if self.c.xfixes_query_version(5, 0).ok().and_then(|c| c.reply().ok()).is_none() {
+            return;
+        }
+        let r = if visible { self.c.xfixes_show_cursor(self.root) } else { self.c.xfixes_hide_cursor(self.root) };
+        if r.is_ok() {
+            self.hidden = !visible;
+            let _ = self.c.flush();
+        }
     }
     fn key(&mut self, code: u16, down: bool) -> io::Result<()> {
         if code > 247 {

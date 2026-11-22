@@ -53,6 +53,8 @@ pub trait Injector: Send {
     fn cursor_pos(&mut self) -> Option<(i32, i32)>;
     /// Press/release a physical key (evdev code).
     fn key(&mut self, code: u16, down: bool) -> io::Result<()>;
+    /// Show or hide this computer's cursor (hidden while the pointer is on another computer).
+    fn set_cursor_visible(&mut self, _visible: bool) {}
     /// Flush any batched input to the OS.
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
