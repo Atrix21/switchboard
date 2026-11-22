@@ -78,10 +78,40 @@ try:
     ipc(A, {"cmd": "link", "edge": "right", "peer": "beta"})
     ipc(B, {"cmd": "link", "edge": "left", "peer": "alpha"})
 
+    # Clipboard text: pushed on copy, no echo back.
+    msg = "héllo from alpha" + chr(10) + "line 2"
+    ipc(A, {"cmd": "clip_set", "text": msg})
+    wait(lambda: ipc(B, {"cmd": "clip_get"}).get("text") == msg, "text on B", 5)
+    check(True, "clipboard text A->B")
+    time.sleep(1.0)
+    check(ipc(A, {"cmd": "clip_get"})["count"] == 1, "no clipboard echo back to A")
+    ipc(B, {"cmd": "clip_set", "text": "reply from beta"})
+    wait(lambda: ipc(A, {"cmd": "clip_get"}).get("text") == "reply from beta", "text on A", 5)
+    check(True, "clipboard text B->A")
+
+    # Files: offered on copy, transferred when the pointer moves to B.
+    src = os.path.join(root, "files")
+    os.makedirs(os.path.join(src, "folder", "sub"))
+    payload = os.urandom(300_000)
+    open(os.path.join(src, "folder", "sub", "big.bin"), "wb").write(payload)
+    open(os.path.join(src, "folder", "a.txt"), "w").write("A")
+    open(os.path.join(src, "note.txt"), "w").write("note")
+    ipc(A, {"cmd": "clip_set", "files": [os.path.join(src, "folder"), os.path.join(src, "note.txt")]})
+    time.sleep(0.5)
+    check("files" not in ipc(B, {"cmd": "clip_get"}), "files not sent before the pointer moves")
+
     # Edge cross: cursor at right edge, push right.
     ipc(A, {"cmd": "synth", "x": 1919, "y": 540, "events": [["m", 4, 0]]})
     wait(lambda: ipc(A, {"cmd": "status"})["mode"].startswith("controlling"), "A controlling")
     wait(lambda: ipc(B, {"cmd": "status"})["mode"].startswith("controlled"), "B hosted")
+    wait(lambda: "files" in ipc(B, {"cmd": "clip_get"}), "files on B", 10)
+    got = ipc(B, {"cmd": "clip_get"})["files"]
+    names = sorted(os.path.basename(f) for f in got)
+    check(names == ["folder", "note.txt"], f"received top-level items {names}")
+    fdir = [f for f in got if f.endswith("folder")][0]
+    check(open(os.path.join(fdir, "sub", "big.bin"), "rb").read() == payload, "300 KB file byte-identical")
+    check(open(os.path.join(fdir, "a.txt")).read() == "A", "folder structure preserved")
+    import shutil; shutil.rmtree(os.path.dirname(fdir), ignore_errors=True)
     r = ipc(B, {"cmd": "recorded"})
     check((r["x"], r["y"]) == (1, 540), f"entry point on B left edge = {(r['x'], r['y'])}")
 

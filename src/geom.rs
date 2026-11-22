@@ -90,11 +90,12 @@ pub fn entry_point(seg: &Rect, edge: Edge, pos: f32) -> (i32, i32) {
 pub struct Push {
     acc: i32,
     armed: bool,
+    since: Option<std::time::Instant>,
 }
 
 impl Default for Push {
     fn default() -> Self {
-        Push { acc: 0, armed: true }
+        Push { acc: 0, armed: true, since: None }
     }
 }
 
@@ -102,6 +103,28 @@ impl Push {
     pub fn disarm(&mut self) {
         self.acc = 0;
         self.armed = false;
+        self.since = None;
+    }
+
+    /// Like [`feed`](Self::feed), but also requires the push to be sustained for `dwell`.
+    pub fn feed_dwell(&mut self, on_edge: bool, out: i32, resistance: i32, dwell: std::time::Duration) -> bool {
+        if !on_edge || out < 0 {
+            self.since = None;
+        }
+        if dwell.is_zero() {
+            return self.feed(on_edge, out, resistance);
+        }
+        if on_edge && out > 0 && self.armed {
+            let t = *self.since.get_or_insert_with(std::time::Instant::now);
+            self.acc += out;
+            if self.acc > resistance && t.elapsed() >= dwell {
+                self.acc = 0;
+                self.since = None;
+                return true;
+            }
+            return false;
+        }
+        self.feed(on_edge, out, resistance)
     }
     /// Feed one motion sample. Returns true when the push exceeds `resistance`.
     pub fn feed(&mut self, on_edge: bool, out: i32, resistance: i32) -> bool {

@@ -125,6 +125,13 @@ pub fn screens() -> Vec<ScreenInfo> {
     os::screens()
 }
 
+pub fn clipboard() -> io::Result<Arc<dyn crate::clipboard::Backend>> {
+    if std::env::var("SWITCHBOARD_INJECT").as_deref() == Ok("null") {
+        return Ok(Arc::new(null::MemClipboard::default()));
+    }
+    os::clipboard::new()
+}
+
 pub fn start_capture(handler: Arc<dyn CaptureHandler>, opts: CaptureOptions) -> io::Result<Arc<dyn Capture>> {
     if std::env::var("SWITCHBOARD_CAPTURE").as_deref() == Ok("none") {
         return Ok(Arc::new(null::NoCapture));

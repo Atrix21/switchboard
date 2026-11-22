@@ -5,6 +5,9 @@ cd "$(dirname "$0")/.."
 export PATH="$HOME/.cargo/bin:$PATH"
 ./target/release/switchboard.exe quit >/dev/null 2>&1 || true
 cargo build --release 2>&1 | grep -E "^(error|warning)" -A6 | head -40 || true
+# Gate: never deploy a Windows build whose real capture path is broken.
+./target/release/switchboard.exe selftest >/tmp/sb-selftest.log 2>&1 || { cat /tmp/sb-selftest.log; echo "SELFTEST FAILED - not deploying"; exit 1; }
+tail -1 /tmp/sb-selftest.log
 ./scripts/sync-linux.sh --no-build
 ssh "${SB_LINUX_HOST:-sbl}" bash -s <<'REMOTE'
 pkill -f "[s]witchboard run" || true

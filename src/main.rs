@@ -113,6 +113,45 @@ fn main() {
                 }
             }
         }
+        ["clip", "get"] => match platform::clipboard() {
+            Ok(c) => {
+                match c.read() {
+                    Some(clipboard::Clip::Text(t)) => println!("text: {t}"),
+                    Some(clipboard::Clip::Png(p)) => println!("image: {} bytes PNG", p.len()),
+                    Some(clipboard::Clip::Files(f)) => println!("files: {f:?}"),
+                    None => println!("(empty or unsupported)"),
+                }
+                0
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                1
+            }
+        },
+        ["clip", "set", text @ ..] => match platform::clipboard() {
+            Ok(c) => {
+                let r = c.write(&clipboard::Clip::Text(text.join(" ")));
+                // X11: the owner must stay alive to serve paste requests.
+                std::thread::sleep(Duration::from_secs(if cfg!(windows) { 0 } else { 5 }));
+                if r.is_ok() { 0 } else { 1 }
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                1
+            }
+        },
+        #[cfg(windows)]
+        ["selftest"] => match platform::os::selftest() {
+            Ok(r) => {
+                println!("{r}
+SELFTEST PASS");
+                0
+            }
+            Err(e) => {
+                eprintln!("SELFTEST FAIL: {e}");
+                1
+            }
+        },
         ["screens"] => {
             for s in platform::screens() {
                 println!("{:<56} x={:<6} y={:<6} {}x{}{}", s.name, s.rect.x, s.rect.y, s.rect.w, s.rect.h, if s.primary { "  (primary)" } else { "" });
@@ -164,7 +203,7 @@ fn run(log_file: bool) -> i32 {
             return 1;
         }
     };
-    let _ = e.clip.set(std::sync::Arc::new(clipboard::ClipSync));
+    let _ = e.clip.set(clipboard::ClipSync::start(&e));
     if let Err(err) = ipc::serve(e.clone()) {
         log::error!("IPC unavailable: {err}");
     }

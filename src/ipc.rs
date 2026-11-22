@@ -115,7 +115,7 @@ pub fn handle(e: &Arc<Engine>, req: Value) -> Value {
                         }
                         let to_screen = s("to_screen");
                         let to_edge = serde_json::from_value(req["to_edge"].clone()).ok();
-                        c.links.push(crate::config::Link { edge, peer: peer.clone(), screen, to_screen, to_edge });
+                        c.links.push(crate::config::Link { edge, peer: peer.clone(), screen, to_screen, to_edge, dwell_ms: req["dwell_ms"].as_u64() });
                         let _ = c.save();
                     }
                     e.reload_config();
@@ -179,6 +179,27 @@ pub fn handle(e: &Arc<Engine>, req: Value) -> Value {
                 e.on_capture(ce, cursor);
             }
             Ok(json!({"ok": true}))
+        }
+        "clip_set" if std::env::var("SWITCHBOARD_TEST").is_ok() => {
+            use crate::clipboard::{Backend, Clip};
+            let c = if let Some(t) = req["text"].as_str() {
+                Clip::Text(t.into())
+            } else if let Some(fs) = req["files"].as_array() {
+                Clip::Files(fs.iter().filter_map(|f| f.as_str().map(std::path::PathBuf::from)).collect())
+            } else {
+                return json!({"ok": false});
+            };
+            crate::platform::null::mem_clipboard().write(&c).map(|_| json!({"ok": true})).map_err(|e| e.to_string())
+        }
+        "clip_get" if std::env::var("SWITCHBOARD_TEST").is_ok() => {
+            use crate::clipboard::Clip;
+            let g = crate::platform::null::mem_clipboard().inner.lock().unwrap();
+            Ok(match &g.1 {
+                Some(Clip::Text(t)) => json!({"count": g.0, "text": t}),
+                Some(Clip::Files(f)) => json!({"count": g.0, "files": f}),
+                Some(Clip::Png(p)) => json!({"count": g.0, "png_bytes": p.len()}),
+                None => json!({"count": g.0}),
+            })
         }
         "recorded" if std::env::var("SWITCHBOARD_TEST").is_ok() => {
             let r = crate::platform::null::recorded();

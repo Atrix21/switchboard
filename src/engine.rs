@@ -74,7 +74,7 @@ pub struct Peer {
 }
 
 impl Peer {
-    fn send(&self, m: Ctrl) {
+    pub fn send(&self, m: Ctrl) {
         if let Err(e) = self.sess.send(&Frame::Ctrl(m)) {
             log::debug!("send to {}: {e}", self.fp);
             self.alive.store(false, Ordering::Relaxed);
@@ -122,7 +122,7 @@ struct SinkState {
     last_seq: u64,
     last_echo: u64,
     /// (edge, segment, landing target on the source) for every link back to the source.
-    returns: Vec<(Edge, Rect, Target)>,
+    returns: Vec<(Edge, Rect, Target, u64)>,
     push: Vec<Push>,
     last_ack: Option<Instant>,
     received: u32,
@@ -140,6 +140,7 @@ struct KbSource {
     last_send: Option<Instant>,
     /// Keys consumed by a local hotkey (their release is swallowed too).
     swallowed: KeySet,
+    unacked_since: Option<Instant>,
     enc: Vec<u8>,
     dgram: Vec<u8>,
 }
@@ -232,6 +233,10 @@ pub struct Engine {
     dialing: Mutex<HashMap<String, Instant>>,
     pub clip: OnceLock<Arc<crate::clipboard::ClipSync>>,
     shutting_down: AtomicBool,
+    /// Events that reached `on_capture` (paired with platform swallowed count
+    /// to detect input being blocked locally but not forwarded).
+    captured: AtomicU64,
+    dead_check: Mutex<(Instant, u64, u64)>,
     seq_drop: AtomicU64,
 }
 
@@ -310,6 +315,8 @@ impl Engine {
             dialing: Mutex::new(HashMap::new()),
             clip: OnceLock::new(),
             shutting_down: AtomicBool::new(false),
+            captured: AtomicU64::new(0),
+            dead_check: Mutex::new((Instant::now(), 0, 0)),
             seq_drop: AtomicU64::new(0),
         });
         e.refresh_links();
@@ -519,6 +526,7 @@ impl Engine {
 
     pub fn on_capture(&self, ev: CapEvent, cursor: (i32, i32)) {
         let t0 = Instant::now();
+        self.captured.fetch_add(1, Ordering::Relaxed);
         if let CapEvent::Hotkey { id } = ev {
             let _ = self.tx.send(Ev::Hotkey(id));
             return;
@@ -615,7 +623,7 @@ impl Engine {
             let pos = geom::on_edge(&screens, seg, link.edge, cursor.0, cursor.1, deadzone);
             let out = geom::outward(link.edge, dx, dy);
             let push = st.push.entry(i).or_default();
-            if push.feed(pos.is_some(), out, resistance) {
+            if push.feed_dwell(pos.is_some(), out, resistance, Duration::from_millis(link.dwell_ms.unwrap_or(0))) {
                 hit = Some((link.clone(), *seg, pos.unwrap()));
                 break;
             }
@@ -773,7 +781,12 @@ impl Engine {
             st.kb.target = None;
         }
         match new {
-            Some(p) if follow && p.trusted.load(Ordering::Relaxed) => {
+            Some(p) if !follow => {
+                if let Some(c) = self.clip.get() {
+                    c.on_focus(&p);
+                }
+            }
+            Some(p) if p.trusted.load(Ordering::Relaxed) => {
                 st.kb.target = Some(p.clone());
                 st.kb.st = KeyState { epoch: st.next_epoch, ..Default::default() };
                 st.next_epoch = st.next_epoch.wrapping_add(1);
@@ -785,6 +798,9 @@ impl Engine {
                     c.set_keyboard_forwarding(true);
                 }
                 log::info!("keyboard -> {}", p.name());
+                if let Some(c) = self.clip.get() {
+                    c.on_focus(&p);
+                }
             }
             _ => {
                 if let Some(c) = self.capture.get() {
@@ -1075,10 +1091,10 @@ impl Engine {
                 if sk.push.len() != sk.returns.len() {
                     sk.push = (0..sk.returns.len()).map(|_| Push::default()).collect();
                 }
-                for (i, (edge, seg, to)) in sk.returns.iter().enumerate() {
+                for (i, (edge, seg, to, dwell)) in sk.returns.iter().enumerate() {
                     let pos = geom::on_edge(&screens, seg, *edge, x, y, deadzone);
                     let out = geom::outward(*edge, moved.0, moved.1);
-                    if sk.push[i].feed(pos.is_some(), out, resistance) && sk.pressed == 0 {
+                    if sk.push[i].feed_dwell(pos.is_some(), out, resistance, Duration::from_millis(*dwell)) && sk.pressed == 0 {
                         leave = Some((*edge, pos.unwrap(), to.clone()));
                         break;
                     }
@@ -1184,6 +1200,21 @@ impl Engine {
         let timeout = Duration::from_millis(self.cfg.read().unwrap().switching.peer_timeout_ms);
         let mut st = self.st.lock().unwrap();
         let st = &mut *st;
+        // Keyboard safety: if the target stops acknowledging keys, give the
+        // keyboard back to this machine instead of typing into the void.
+        if st.kb.target.is_some() && st.kb.acked < st.kb.seq && st.kb.last_send.is_some() {
+            let first_unacked_age = st.kb.unacked_since.get_or_insert_with(Instant::now).elapsed();
+            if first_unacked_age > Duration::from_millis(1200) {
+                log::error!("keyboard target stopped acknowledging; keyboard returned to this computer");
+                if matches!(st.mode, Mode::Remote { .. }) {
+                    self.end_remote(st, "keyboard target unresponsive", None);
+                } else {
+                    self.set_focus(st, None);
+                }
+            }
+        } else {
+            st.kb.unacked_since = None;
+        }
         // Keyboard: resend until acknowledged; keepalive while keys are held.
         if st.kb.target.is_some() {
             let since = st.kb.last_send.map(|t| t.elapsed()).unwrap_or(Duration::MAX);
@@ -1197,7 +1228,21 @@ impl Engine {
         }
         match st.mode.clone() {
             Mode::Remote { peer, .. } => {
-                if platform::os::take_failsafe() {
+                let dead = {
+                    let mut d = self.dead_check.lock().unwrap();
+                    let (sw, cap) = (platform::os::swallowed_count(), self.captured.load(Ordering::Relaxed));
+                    if d.0.elapsed() >= Duration::from_millis(400) {
+                        let dead = sw.saturating_sub(d.1) > 40 && cap == d.2;
+                        *d = (Instant::now(), sw, cap);
+                        dead
+                    } else {
+                        false
+                    }
+                };
+                if dead {
+                    log::error!("FAIL-SAFE: input was being blocked locally but not forwarded; returning control");
+                    self.end_remote(st, "fail-safe (capture stalled)", None);
+                } else if platform::os::take_failsafe() {
                     log::error!("FAIL-SAFE: local mouse was being blocked but raw input was not arriving; returned control");
                     self.end_remote(st, "fail-safe (raw input missing)", None);
                 } else if !peer.alive.load(Ordering::Relaxed) {
@@ -1425,11 +1470,11 @@ impl Engine {
                     self.end_remote(st, "peer took control", None);
                 }
                 let screens = self.screens.read().unwrap().clone();
-                let returns: Vec<(Edge, Rect, Target)> = st.links.iter().filter(|(l, _)| l.peer == p.name()).map(|(l, r)| (l.edge, *r, Target { screen: l.to_screen.clone(), edge: l.to_edge })).collect();
+                let returns: Vec<(Edge, Rect, Target, u64)> = st.links.iter().filter(|(l, _)| l.peer == p.name()).map(|(l, r)| (l.edge, *r, Target { screen: l.to_screen.clone(), edge: l.to_edge }, l.dwell_ms.unwrap_or(0))).collect();
                 // Landing place: explicit target from the source, else our first link to it, else the opposite edge of the desktop.
                 let land_edge = to_edge.unwrap_or_else(|| returns.first().map(|r| r.0).unwrap_or(edge.opposite()));
                 let land_seg = to_screen.as_deref().and_then(|n| geom::segment(&screens, land_edge, Some(n))).or_else(|| returns.first().map(|r| r.1)).unwrap_or_else(|| geom::desktop(&screens));
-                let returns = if returns.is_empty() { vec![(land_edge, land_seg, Target::default())] } else { returns };
+                let returns = if returns.is_empty() { vec![(land_edge, land_seg, Target::default(), 0)] } else { returns };
                 let push = returns.iter().map(|_| { let mut p = Push::default(); p.disarm(); p }).collect();
                 st.sink = SinkState { returns, push, ..Default::default() };
                 st.mode = Mode::Hosted { peer: p.clone(), epoch };
@@ -1596,6 +1641,7 @@ impl Engine {
             "peers": peers,
             "discovered": disc,
             "monitor": self.monitor.status(),
+            "transfers": self.clip.get().map(|c| c.transfers()).unwrap_or_default(),
             "capture": self.capture.get().is_some(),
             "injector": self.inj.lock().unwrap().name(),
             "stats": {
@@ -1614,6 +1660,7 @@ impl Engine {
                 "last_switch_reason": stats.last_switch_reason,
                 "hook_swallowed": hook_counters().0,
                 "raw_while_forwarding": hook_counters().1,
+                "hook_callback_max_us": hook_counters().2,
                 "cpu_s": cpu,
                 "rss_bytes": mem,
             }
@@ -1685,14 +1732,14 @@ impl Engine {
     }
 }
 
-fn hook_counters() -> (u32, u32) {
+fn hook_counters() -> (u32, u32, u32) {
     #[cfg(windows)]
     {
-        (platform::os::HOOK_SWALLOWED.load(Ordering::Relaxed), platform::os::RAW_WHILE_FORWARDING.load(Ordering::Relaxed))
+        (platform::os::HOOK_SWALLOWED.load(Ordering::Relaxed), platform::os::RAW_WHILE_FORWARDING.load(Ordering::Relaxed), platform::os::HOOK_MAX_US.load(Ordering::Relaxed))
     }
     #[cfg(not(windows))]
     {
-        (0, 0)
+        (0, 0, 0)
     }
 }
 

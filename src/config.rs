@@ -48,6 +48,10 @@ pub struct Link {
     /// …at this edge of it. Default: the opposite of `edge`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub to_edge: Option<Edge>,
+    /// Require the pointer to be held against the edge this long before
+    /// switching (guards gestures that are costly to trigger by accident).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dwell_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

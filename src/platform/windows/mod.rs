@@ -168,7 +168,30 @@ pub static HOOK_SWALLOWED: AtomicU32 = AtomicU32::new(0);
 /// throttles background raw input, so the hook is the data source).
 pub static RAW_WHILE_FORWARDING: AtomicU32 = AtomicU32::new(0);
 
-static HOOK_HANDLER: std::sync::OnceLock<Arc<dyn CaptureHandler>> = std::sync::OnceLock::new();
+/// Hook callbacks never call into the engine directly. While a low-level hook
+/// is installed, Windows waits for the callback before delivering ANY input to
+/// the system, so a callback that blocks (e.g. on an engine lock) freezes the
+/// whole desktop's mouse and keyboard. The callbacks only decide swallow/pass
+/// from atomics and enqueue the event; a worker thread runs the handler.
+///
+/// Invariant: an event is swallowed only if it was handed to the queue.
+static HOOK_QUEUE: std::sync::OnceLock<mpsc::Sender<(CapEvent, (i32, i32))>> = std::sync::OnceLock::new();
+/// Slowest hook callback observed, µs (diagnostics).
+pub static HOOK_MAX_US: AtomicU32 = AtomicU32::new(0);
+
+/// Hand an event to the worker. Returns false if there is no consumer, in
+/// which case the caller must let the event through to Windows.
+#[inline]
+fn enqueue(ev: CapEvent, pos: (i32, i32)) -> bool {
+    HOOK_QUEUE.get().is_some_and(|q| q.send((ev, pos)).is_ok())
+}
+
+struct HookTimer(std::time::Instant);
+impl Drop for HookTimer {
+    fn drop(&mut self) {
+        HOOK_MAX_US.fetch_max(self.0.elapsed().as_micros() as u32, Ordering::Relaxed);
+    }
+}
 
 const WM_APP_HOOK_ON: u32 = WM_APP + 1;
 const WM_APP_HOOK_OFF: u32 = WM_APP + 2;
@@ -176,14 +199,22 @@ const WM_APP_KB_ON: u32 = WM_APP + 3;
 const WM_APP_KB_OFF: u32 = WM_APP + 4;
 
 static KB_FORWARDING: AtomicBool = AtomicBool::new(false);
+/// Self-test only: treat our own injected events as physical input.
+static SELFTEST: AtomicBool = AtomicBool::new(false);
+#[inline]
+fn is_physical(flags_injected: bool, extra: usize) -> bool {
+    !flags_injected || (SELFTEST.load(Ordering::Relaxed) && extra == SELFTEST_TAG)
+}
+const SELFTEST_TAG: usize = 0x5342_5354; // "SBST"
 /// VKs that were already down when keyboard forwarding started: their
 /// release must reach the local desktop or the key would stay stuck here.
 static KB_HELD_AT_GRAB: [AtomicBool; 256] = [const { AtomicBool::new(false) }; 256];
 
 unsafe extern "system" fn ll_kbd_proc(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    let _t = HookTimer(std::time::Instant::now());
     if code == HC_ACTION as i32 && KB_FORWARDING.load(Ordering::Relaxed) {
         let k = &*(lp as *const KBDLLHOOKSTRUCT);
-        if k.flags & LLKHF_INJECTED == 0 {
+        if is_physical(k.flags & LLKHF_INJECTED != 0, k.dwExtraInfo) {
             let up = k.flags & LLKHF_UP != 0;
             let vk = (k.vkCode & 0xff) as usize;
             if KB_HELD_AT_GRAB[vk].load(Ordering::Relaxed) {
@@ -197,10 +228,13 @@ unsafe extern "system" fn ll_kbd_proc(code: i32, wp: WPARAM, lp: LPARAM) -> LRES
             if scan == 0 {
                 scan = MapVirtualKeyW(k.vkCode, MAPVK_VK_TO_VSC) as u16;
             }
-            if let (Some(evdev), Some(h)) = (crate::keymap::win_to_evdev(scan, ext, k.vkCode == VK_PAUSE as u32), HOOK_HANDLER.get()) {
-                h.on_event(CapEvent::Key { code: evdev, down: !up }, (0, 0));
+            let handed = match crate::keymap::win_to_evdev(scan, ext, k.vkCode == VK_PAUSE as u32) {
+                Some(evdev) => enqueue(CapEvent::Key { code: evdev, down: !up }, (0, 0)),
+                None => HOOK_QUEUE.get().is_some(), // unmapped key: drop it, but only if we are really forwarding
+            };
+            if handed {
+                return 1;
             }
-            return 1;
         }
     }
     CallNextHookEx(null_mut(), code, wp, lp)
@@ -213,11 +247,12 @@ unsafe extern "system" fn ll_kbd_proc(code: i32, wp: WPARAM, lp: LPARAM) -> LRES
 /// event `pt - park` is exactly that event's motion after Windows pointer
 /// ballistics (the user's pointer speed / "enhance pointer precision").
 unsafe extern "system" fn ll_mouse_proc(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    let _t = HookTimer(std::time::Instant::now());
     if code == HC_ACTION as i32 && FORWARDING.load(Ordering::Relaxed) {
         let info = &*(lp as *const MSLLHOOKSTRUCT);
-        if info.flags & LLMHF_INJECTED == 0 {
+        if is_physical(info.flags & LLMHF_INJECTED != 0, info.dwExtraInfo) {
             HOOK_SWALLOWED.fetch_add(1, Ordering::Relaxed);
-            if let Some(h) = HOOK_HANDLER.get() {
+            if HOOK_QUEUE.get().is_some() {
                 let park = (PARK_X.load(Ordering::Relaxed), PARK_Y.load(Ordering::Relaxed));
                 let hi = (info.mouseData >> 16) as u16;
                 let x = |down| if hi == 1 { Some(CapEvent::Button { button: Button::Back, down }) } else if hi == 2 { Some(CapEvent::Button { button: Button::Forward, down }) } else { None };
@@ -239,10 +274,12 @@ unsafe extern "system" fn ll_mouse_proc(code: i32, wp: WPARAM, lp: LPARAM) -> LR
                     _ => None,
                 };
                 if let Some(ev) = ev {
-                    h.on_event(ev, park);
+                    if !enqueue(ev, park) {
+                        return CallNextHookEx(null_mut(), code, wp, lp);
+                    }
                 }
+                return 1;
             }
-            return 1;
         }
     }
     CallNextHookEx(null_mut(), code, wp, lp)
@@ -559,6 +596,17 @@ fn raw_thread(handler: Arc<dyn CaptureHandler>, hotkeys: Vec<Hotkey>, ready: mps
 }
 
 pub fn start_capture(handler: Arc<dyn CaptureHandler>, opts: CaptureOptions) -> io::Result<Arc<dyn Capture>> {
+    let (qtx, qrx) = mpsc::channel::<(CapEvent, (i32, i32))>();
+    {
+        let handler = handler.clone();
+        std::thread::Builder::new().name("sb-hookwork".into()).spawn(move || {
+            unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST) };
+            while let Ok((ev, pos)) = qrx.recv() {
+                handler.on_event(ev, pos);
+            }
+        })?;
+    }
+    let _ = HOOK_QUEUE.set(qtx);
     let (tx, rx) = mpsc::channel();
     std::thread::Builder::new().name("sb-hook".into()).spawn(move || hook_thread(tx))?;
     let hook_thread = rx.recv().map_err(io::Error::other)?;
@@ -601,4 +649,86 @@ pub fn process_stats() -> (f64, u64) {
 
 pub fn take_failsafe() -> bool {
     false
+}
+
+/// Events blocked locally by the hooks (for the engine's dead-forwarding check).
+pub fn swallowed_count() -> u64 {
+    HOOK_SWALLOWED.load(Ordering::Relaxed) as u64
+}
+
+/// End-to-end check of the real capture path (hooks + worker queue + handler)
+/// using tagged synthetic input. Always restores local input before returning.
+pub fn selftest() -> Result<String, String> {
+    use std::sync::Mutex;
+    struct Rec(Mutex<Vec<CapEvent>>);
+    impl CaptureHandler for Rec {
+        fn on_event(&self, ev: CapEvent, _: (i32, i32)) {
+            self.0.lock().unwrap().push(ev);
+        }
+    }
+    let rec = Arc::new(Rec(Mutex::new(vec![])));
+    let cap = start_capture(rec.clone(), CaptureOptions { hotkeys: vec![] }).map_err(|e| e.to_string())?;
+    let send = |inputs: &[INPUT]| unsafe { SendInput(inputs.len() as u32, inputs.as_ptr(), size_of::<INPUT>() as i32) };
+    let mi = |dx, dy, data: i32, flags| INPUT { r#type: INPUT_MOUSE, Anonymous: INPUT_0 { mi: MOUSEINPUT { dx, dy, mouseData: data as _, dwFlags: flags, time: 0, dwExtraInfo: SELFTEST_TAG } } };
+    let ki = |scan: u16, up: bool| INPUT { r#type: INPUT_KEYBOARD, Anonymous: INPUT_0 { ki: KEYBDINPUT { wVk: 0, wScan: scan, dwFlags: KEYEVENTF_SCANCODE | if up { KEYEVENTF_KEYUP } else { 0 }, time: 0, dwExtraInfo: SELFTEST_TAG } } };
+    let wait = |n: usize| {
+        for _ in 0..100 {
+            if rec.0.lock().unwrap().len() >= n {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    };
+    let start = cursor();
+    SELFTEST.store(true, Ordering::SeqCst);
+    let mut report = vec![];
+    let res: Result<(), String> = (|| {
+        cap.set_forwarding(true, start);
+        cap.set_keyboard_forwarding(true);
+        std::thread::sleep(std::time::Duration::from_millis(100)); // hooks installed by the hook thread
+        let park = cursor();
+        // Movement + a middle click (harmless) + F24 key (scancode 0x76, unused by apps).
+        send(&[mi(7, 3, 0, MOUSEEVENTF_MOVE), mi(0, 0, 0, MOUSEEVENTF_MIDDLEDOWN), mi(0, 0, 0, MOUSEEVENTF_MIDDLEUP), mi(0, 0, 120, MOUSEEVENTF_WHEEL)]);
+        send(&[ki(0x76, false), ki(0x76, true)]);
+        wait(6);
+        let got = rec.0.lock().unwrap().clone();
+        report.push(format!("events received while forwarding: {got:?}"));
+        if !got.iter().any(|e| matches!(e, CapEvent::Motion { .. })) {
+            return Err("motion not delivered to handler".into());
+        }
+        if !got.contains(&CapEvent::Button { button: Button::Middle, down: true }) || !got.contains(&CapEvent::Button { button: Button::Middle, down: false }) {
+            return Err("buttons not delivered".into());
+        }
+        if !got.contains(&CapEvent::Wheel { v: 120, h: 0 }) {
+            return Err("wheel not delivered".into());
+        }
+        if !got.contains(&CapEvent::Key { code: 194, down: true }) || !got.contains(&CapEvent::Key { code: 194, down: false }) {
+            return Err("keys not delivered".into());
+        }
+        if cursor() != park {
+            return Err(format!("cursor moved locally while forwarding ({park:?} -> {:?})", cursor()));
+        }
+        report.push("local cursor stayed parked (input blocked locally)".into());
+        Ok(())
+    })();
+    cap.set_keyboard_forwarding(false);
+    cap.set_forwarding(false, start);
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    // After forwarding: input must reach Windows again.
+    let before = cursor();
+    let n0 = rec.0.lock().unwrap().len();
+    send(&[mi(5, 0, 0, MOUSEEVENTF_MOVE)]);
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let after = cursor();
+    let passthrough = after != before && rec.0.lock().unwrap()[n0..].iter().all(|e| !matches!(e, CapEvent::Key { .. }));
+    let _ = unsafe { SetCursorPos(start.0, start.1) };
+    SELFTEST.store(false, Ordering::SeqCst);
+    res?;
+    if !passthrough {
+        return Err(format!("input did not reach Windows after forwarding stopped ({before:?} -> {after:?})"));
+    }
+    report.push("input flows to Windows again after forwarding stops".into());
+    report.push(format!("slowest hook callback: {} µs", HOOK_MAX_US.load(Ordering::Relaxed)));
+    Ok(report.join("
+"))
 }

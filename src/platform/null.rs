@@ -81,6 +81,32 @@ impl Injector for RecordingInjector {
     }
 }
 
+/// In-memory clipboard for tests.
+#[derive(Default)]
+pub struct MemClipboard {
+    pub inner: Mutex<(u64, Option<crate::clipboard::Clip>)>,
+}
+
+pub fn mem_clipboard() -> &'static MemClipboard {
+    static C: OnceLock<MemClipboard> = OnceLock::new();
+    C.get_or_init(MemClipboard::default)
+}
+
+impl crate::clipboard::Backend for MemClipboard {
+    fn change_count(&self) -> u64 {
+        mem_clipboard().inner.lock().unwrap().0
+    }
+    fn read(&self) -> Option<crate::clipboard::Clip> {
+        mem_clipboard().inner.lock().unwrap().1.clone()
+    }
+    fn write(&self, c: &crate::clipboard::Clip) -> io::Result<()> {
+        let mut g = mem_clipboard().inner.lock().unwrap();
+        g.0 += 1;
+        g.1 = Some(c.clone());
+        Ok(())
+    }
+}
+
 pub struct NoCapture;
 impl Capture for NoCapture {
     fn set_forwarding(&self, _on: bool, _park: (i32, i32)) {}

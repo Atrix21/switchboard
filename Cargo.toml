@@ -16,6 +16,7 @@ getrandom = "0.2"
 blake2 = "0.10"
 
 [target.'cfg(windows)'.dependencies]
+png = "0.17"
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",

@@ -510,3 +510,7 @@ pub fn on_terminate(f: Box<dyn Fn() + Send + Sync>) {
 pub fn take_failsafe() -> bool {
     false
 }
+
+pub fn swallowed_count() -> u64 {
+    0
+}
