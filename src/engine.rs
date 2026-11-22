@@ -1,0 +1,1413 @@
+//! The Switchboard engine: peers, pointer ownership state machine, input
+//! forwarding (source) and injection (sink), watchdogs, pairing.
+//!
+//! Threads:
+//! * capture thread (platform) → [`Engine::on_capture`]: edge detection and,
+//!   while forwarding, encodes + sends input datagrams inline (no thread hop).
+//! * UDP thread → [`Engine::on_datagram`]: sink-side decode + inject inline;
+//!   source-side ack processing.
+//! * one reader thread per peer control channel → events to the engine thread.
+//! * engine thread: control messages, timers (keepalive, watchdogs, pings,
+//!   reconnects), IPC requests.
+//!
+//! Lock order: `st` → `inj`. Never call into the network while holding `peers`.
+
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::time::{Duration, Instant};
+
+use serde_json::{json, Value};
+
+use crate::config::{Config, Link, PeerConfig};
+use crate::ddc::Coordinator;
+use crate::geom::{self, Push};
+use crate::net::{self, Identity, Session};
+use crate::platform::{self, CapEvent, Capture, CaptureHandler, CaptureOptions, Hotkey, Injector};
+use crate::proto::*;
+use crate::stats::{Histogram, RateMeter};
+
+pub const HOTKEY_EMERGENCY: u32 = 1;
+pub const HOTKEY_TOGGLE: u32 = 2;
+
+const KEEPALIVE: Duration = Duration::from_millis(50);
+const ACK_INTERVAL: Duration = Duration::from_millis(20);
+const SINK_IDLE_RELEASE: Duration = Duration::from_millis(1000);
+const PING_INTERVAL: Duration = Duration::from_secs(1);
+const PEER_DEAD: Duration = Duration::from_secs(5);
+const PAIR_TIMEOUT: Duration = Duration::from_secs(180);
+
+pub fn now_us() -> u64 {
+    static T0: OnceLock<Instant> = OnceLock::new();
+    T0.get_or_init(Instant::now).elapsed().as_micros() as u64
+}
+
+#[derive(Default)]
+pub struct PeerInfo {
+    pub name: String,
+    pub os: String,
+    pub udp_addr: Option<SocketAddr>,
+    pub send_id: u32,
+    pub screens: Vec<ScreenInfo>,
+    pub monitor_model: String,
+    pub monitor_input: Option<u16>,
+    pub rtt: Histogram,
+    pub hello: bool,
+}
+
+pub struct Peer {
+    pub sess: Session,
+    pub key_hex: String,
+    pub fp: String,
+    /// Id the peer puts in datagrams addressed to us.
+    pub recv_id: u32,
+    pub info: Mutex<PeerInfo>,
+    pub trusted: AtomicBool,
+    pair_local: AtomicBool,
+    pair_remote: AtomicBool,
+    last_rx: Mutex<Instant>,
+    alive: AtomicBool,
+    connected_at: Instant,
+}
+
+impl Peer {
+    fn send(&self, m: Ctrl) {
+        if let Err(e) = self.sess.send(&Frame::Ctrl(m)) {
+            log::debug!("send to {}: {e}", self.fp);
+            self.alive.store(false, Ordering::Relaxed);
+            self.sess.shutdown();
+        }
+    }
+    pub fn name(&self) -> String {
+        let n = self.info.lock().unwrap().name.clone();
+        if n.is_empty() {
+            self.fp.clone()
+        } else {
+            n
+        }
+    }
+}
+
+#[derive(Clone)]
+enum Mode {
+    Local,
+    /// We are the source; our physical pointer drives `peer`.
+    Remote { peer: Arc<Peer>, epoch: u32, exit_edge: Edge, exit_seg: Rect },
+    /// We are the sink; `peer`'s pointer drives our cursor.
+    Hosted { peer: Arc<Peer>, epoch: u32 },
+}
+
+impl Mode {
+    fn label(&self) -> String {
+        match self {
+            Mode::Local => "local".into(),
+            Mode::Remote { peer, .. } => format!("controlling {}", peer.name()),
+            Mode::Hosted { peer, .. } => format!("controlled by {}", peer.name()),
+        }
+    }
+}
+
+#[derive(Default)]
+struct SinkState {
+    cum_dx: i32,
+    cum_dy: i32,
+    wv: i32,
+    wh: i32,
+    ev_seq: u32,
+    pressed: u16,
+    last_rx: Option<Instant>,
+    last_seq: u64,
+    last_echo: u64,
+    ret_edge: Option<Edge>,
+    ret_seg: Rect,
+    push: Push,
+    last_ack: Option<Instant>,
+    received: u32,
+    inject: Histogram,
+}
+
+struct State {
+    mode: Mode,
+    next_epoch: u32,
+    disabled: bool,
+    // ---- source
+    src: InputState,
+    ev_seq: u32,
+    phys_buttons: u16,
+    push: HashMap<usize, Push>,
+    last_ack: Instant,
+    last_send: Instant,
+    sent: u64,
+    chord_since: Option<Instant>,
+    last_phys_motion: Option<Instant>,
+    enc: Vec<u8>,
+    dgram: Vec<u8>,
+    // ---- sink
+    sink: SinkState,
+    // ---- cached geometry
+    links: Vec<(Link, Rect)>,
+}
+
+#[derive(Default)]
+pub struct Stats {
+    pub capture_rate: RateMeter,
+    pub send_rate: RateMeter,
+    pub capture_cost: Histogram,
+    pub udp_rx: u64,
+    pub udp_bad: u64,
+    pub switches: u64,
+    pub last_switch_reason: String,
+    pub acks: u64,
+    pub sink_lost_seq: u64,
+}
+
+pub enum Ev {
+    Connected,
+    Frame(Arc<Peer>, Frame),
+    Closed(Arc<Peer>),
+    SendEnter(Arc<Peer>, u32, Edge, f32),
+    SendLeave(Arc<Peer>, u32, Edge, f32),
+    Hotkey(u32),
+    Ipc(Value, Sender<Value>),
+    Discovered { key_hex: String, addr: SocketAddr, name: String },
+}
+
+pub struct Engine {
+    pub cfg: RwLock<Config>,
+    pub id: Identity,
+    pub fp: String,
+    udp: UdpSocket,
+    pub udp_port: u16,
+    peers: RwLock<Vec<Arc<Peer>>>,
+    st: Mutex<State>,
+    capture: OnceLock<Arc<dyn Capture>>,
+    inj: Mutex<Box<dyn Injector>>,
+    screens: RwLock<Vec<ScreenInfo>>,
+    pub monitor: Coordinator,
+    pub tx: Sender<Ev>,
+    pub stats: Mutex<Stats>,
+    started: Instant,
+    discovered: Mutex<HashMap<String, (SocketAddr, String, Instant)>>,
+    dialing: Mutex<HashMap<String, Instant>>,
+    pub clip: OnceLock<Arc<crate::clipboard::ClipSync>>,
+    shutting_down: AtomicBool,
+    seq_drop: AtomicU64,
+}
+
+struct Handler(Arc<Engine>);
+impl CaptureHandler for Handler {
+    fn on_event(&self, ev: CapEvent, cursor: (i32, i32)) {
+        self.0.on_capture(ev, cursor);
+    }
+}
+
+impl Engine {
+    pub fn start(cfg: Config, id: Identity) -> std::io::Result<(Arc<Engine>, Receiver<Ev>)> {
+        let (tx, rx) = channel();
+        let udp = net::bind_udp(cfg.port)?;
+        let udp_port = udp.local_addr()?.port();
+        let screens = platform::screens();
+        let inj = platform::new_injector()?;
+        log::info!("injector: {}  screens: {}", inj.name(), screens.iter().map(|s| format!("{} {:?}", s.name, s.rect)).collect::<Vec<_>>().join(", "));
+
+        // Shared monitor: resolve model + this machine's input.
+        let mut model = cfg.monitor.model.clone();
+        let mut local_input = cfg.monitor.local_input;
+        if cfg.monitor.enabled {
+            if let Some(m) = crate::ddc::detect(&model) {
+                if model.is_empty() {
+                    model = m.model.clone();
+                }
+                if local_input.is_none() {
+                    local_input = m.connector.as_deref().and_then(crate::ddc::guess_input);
+                }
+                log::info!("shared monitor: {} (ddc {}), this machine on {:?}", m.model, if m.ddc_ok { "ok" } else { "unavailable" }, local_input.map(crate::config::input_name));
+            } else {
+                log::info!("no DDC/CI monitor found{}", if model.is_empty() { String::new() } else { format!(" matching {model:?}") });
+            }
+        }
+        let monitor = Coordinator::new(if cfg.monitor.enabled { model } else { String::new() }, local_input);
+        let fp = id.fingerprint();
+        let e = Arc::new(Engine {
+            cfg: RwLock::new(cfg),
+            id,
+            fp,
+            udp,
+            udp_port,
+            peers: RwLock::new(vec![]),
+            st: Mutex::new(State {
+                mode: Mode::Local,
+                next_epoch: net::random_u32() & 0xffff,
+                disabled: false,
+                src: InputState::default(),
+                ev_seq: 0,
+                phys_buttons: 0,
+                push: HashMap::new(),
+                last_ack: Instant::now(),
+                last_send: Instant::now(),
+                sent: 0,
+                chord_since: None,
+                last_phys_motion: None,
+                enc: Vec::with_capacity(512),
+                dgram: Vec::with_capacity(600),
+                sink: SinkState::default(),
+                links: vec![],
+            }),
+            capture: OnceLock::new(),
+            inj: Mutex::new(inj),
+            screens: RwLock::new(screens),
+            monitor,
+            tx,
+            stats: Mutex::new(Stats::default()),
+            started: Instant::now(),
+            discovered: Mutex::new(HashMap::new()),
+            dialing: Mutex::new(HashMap::new()),
+            clip: OnceLock::new(),
+            shutting_down: AtomicBool::new(false),
+            seq_drop: AtomicU64::new(0),
+        });
+        e.refresh_links();
+
+        // Monitor fallback through a peer.
+        {
+            let w = Arc::downgrade(&e);
+            e.monitor.set_remote_fallback(Some(Box::new(move |input| {
+                let Some(e) = w.upgrade() else { return false };
+                let peers = e.peers.read().unwrap().clone();
+                if let Some(p) = peers.iter().find(|p| p.trusted.load(Ordering::Relaxed) && p.alive.load(Ordering::Relaxed)) {
+                    p.send(Ctrl::MonitorSet { input, req: 0 });
+                    return true;
+                }
+                false
+            })));
+        }
+
+        // Capture
+        let hk = {
+            let c = e.cfg.read().unwrap();
+            [Hotkey::parse(HOTKEY_EMERGENCY, &c.hotkeys.emergency), Hotkey::parse(HOTKEY_TOGGLE, &c.hotkeys.toggle)].into_iter().flatten().collect()
+        };
+        match platform::start_capture(Arc::new(Handler(e.clone())), CaptureOptions { hotkeys: hk }) {
+            Ok(c) => {
+                let _ = e.capture.set(c);
+            }
+            Err(err) => log::error!("capture unavailable: {err} (this machine can receive input but not send it)"),
+        }
+
+        // Listener
+        let l = TcpListener::bind(("0.0.0.0", e.cfg.read().unwrap().port))?;
+        {
+            let e = e.clone();
+            std::thread::Builder::new().name("sb-listen".into()).spawn(move || {
+                for s in l.incoming() {
+                    match s {
+                        Ok(s) => {
+                            let e = e.clone();
+                            std::thread::spawn(move || e.establish(s, false));
+                        }
+                        Err(err) => log::warn!("accept: {err}"),
+                    }
+                }
+            })?;
+        }
+        // UDP receiver
+        {
+            let e = e.clone();
+            std::thread::Builder::new().name("sb-udp".into()).spawn(move || e.udp_loop())?;
+        }
+        Ok((e, rx))
+    }
+
+    fn refresh_links(&self) {
+        let screens = self.screens.read().unwrap().clone();
+        let cfg = self.cfg.read().unwrap();
+        let links = cfg.links.iter().filter_map(|l| geom::segment(&screens, l.edge, l.screen.as_deref()).map(|r| (l.clone(), r))).collect();
+        self.st.lock().unwrap().links = links;
+    }
+
+    pub fn rescan_screens(&self) {
+        let s = platform::screens();
+        let changed = *self.screens.read().unwrap() != s;
+        if changed {
+            log::info!("display layout changed: {}", s.iter().map(|s| format!("{} {:?}", s.name, s.rect)).collect::<Vec<_>>().join(", "));
+            *self.screens.write().unwrap() = s.clone();
+            self.refresh_links();
+            for p in self.peers.read().unwrap().iter() {
+                if p.trusted.load(Ordering::Relaxed) {
+                    p.send(self.hello());
+                }
+            }
+        }
+    }
+
+    fn hello(&self) -> Ctrl {
+        let cfg = self.cfg.read().unwrap();
+        let ms = self.monitor.status();
+        Ctrl::Hello {
+            version: PROTOCOL_VERSION,
+            name: cfg.name.clone(),
+            os: std::env::consts::OS.into(),
+            udp_port: self.udp_port,
+            udp_session: 0, // patched per peer
+            screens: self.screens.read().unwrap().clone(),
+            monitor_model: ms.model,
+            monitor_input: ms.local_input,
+        }
+    }
+
+    // ------------------------------------------------------------ connections
+
+    pub fn dial(self: &Arc<Self>, addr: SocketAddr) {
+        let e = self.clone();
+        std::thread::spawn(move || match TcpStream::connect_timeout(&addr, Duration::from_secs(3)) {
+            Ok(s) => e.establish(s, true),
+            Err(err) => log::debug!("dial {addr}: {err}"),
+        });
+    }
+
+    fn establish(self: &Arc<Self>, s: TcpStream, initiator: bool) {
+        let addr = s.peer_addr().ok();
+        // Never expose the service beyond the local network.
+        if let Some(a) = addr {
+            if !is_local_net(a.ip()) {
+                log::warn!("rejecting non-local connection from {a}");
+                return;
+            }
+        }
+        let sess = match Session::handshake(s, initiator, &self.id) {
+            Ok(x) => x,
+            Err(err) => {
+                log::warn!("handshake with {addr:?} failed: {err}");
+                return;
+            }
+        };
+        let key_hex = net::hex(&sess.remote_static);
+        if sess.remote_static == self.id.public {
+            log::debug!("connected to self; dropping");
+            return;
+        }
+        let trusted = self.cfg.read().unwrap().peer_by_key(&key_hex).is_some();
+        let peer = Arc::new(Peer {
+            fp: net::fingerprint(&sess.remote_static),
+            sess,
+            key_hex,
+            recv_id: net::random_u32(),
+            info: Mutex::new(PeerInfo::default()),
+            trusted: AtomicBool::new(trusted),
+            pair_local: AtomicBool::new(false),
+            pair_remote: AtomicBool::new(false),
+            last_rx: Mutex::new(Instant::now()),
+            alive: AtomicBool::new(true),
+            connected_at: Instant::now(),
+        });
+        if let Some(n) = self.cfg.read().unwrap().peer_by_key(&peer.key_hex) {
+            peer.info.lock().unwrap().name = n.name.clone();
+        }
+        // De-duplicate simultaneous connections deterministically: keep the
+        // session initiated by the side with the smaller fingerprint.
+        {
+            let mut peers = self.peers.write().unwrap();
+            if let Some(i) = peers.iter().position(|p| p.key_hex == peer.key_hex && p.alive.load(Ordering::Relaxed)) {
+                let preferred_initiator_is_me = self.fp < peer.fp;
+                let new_ok = peer.sess.initiator == preferred_initiator_is_me;
+                let old_ok = peers[i].sess.initiator == preferred_initiator_is_me;
+                if old_ok || !new_ok {
+                    log::debug!("duplicate connection to {}; keeping existing", peer.fp);
+                    peer.sess.shutdown();
+                    return;
+                }
+                peers[i].alive.store(false, Ordering::Relaxed);
+                peers[i].sess.shutdown();
+                peers.remove(i);
+            }
+            peers.retain(|p| p.alive.load(Ordering::Relaxed));
+            peers.push(peer.clone());
+        }
+        log::info!("connected {} {} ({})", if trusted { "peer" } else { "UNPAIRED device" }, peer.fp, peer.sess.peer_addr);
+        let mut h = self.hello();
+        if let Ctrl::Hello { udp_session, .. } = &mut h {
+            *udp_session = peer.recv_id;
+        }
+        peer.send(h);
+        if !trusted {
+            peer.send(Ctrl::PairPending);
+        }
+        let _ = self.tx.send(Ev::Connected);
+        // Reader loop
+        let tx = self.tx.clone();
+        loop {
+            match peer.sess.recv() {
+                Ok(f) => {
+                    *peer.last_rx.lock().unwrap() = Instant::now();
+                    if tx.send(Ev::Frame(peer.clone(), f)).is_err() {
+                        break;
+                    }
+                }
+                Err(e) if matches!(e.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock) => {
+                    if !peer.alive.load(Ordering::Relaxed) || peer.last_rx.lock().unwrap().elapsed() > PEER_DEAD {
+                        log::warn!("peer {} timed out", peer.fp);
+                        break;
+                    }
+                }
+                Err(e) => {
+                    log::info!("peer {} disconnected: {e}", peer.fp);
+                    break;
+                }
+            }
+        }
+        peer.alive.store(false, Ordering::Relaxed);
+        peer.sess.shutdown();
+        let _ = tx.send(Ev::Closed(peer));
+    }
+
+    pub fn trusted_peers(&self) -> Vec<Arc<Peer>> {
+        self.peers.read().unwrap().iter().filter(|p| p.trusted.load(Ordering::Relaxed) && p.alive.load(Ordering::Relaxed)).cloned().collect()
+    }
+
+    fn peer_by_name(&self, name: &str) -> Option<Arc<Peer>> {
+        self.trusted_peers().into_iter().find(|p| p.name() == name || p.fp == name)
+    }
+
+    // ------------------------------------------------------------ source side
+
+    pub fn on_capture(&self, ev: CapEvent, cursor: (i32, i32)) {
+        let t0 = Instant::now();
+        if let CapEvent::Hotkey { id } = ev {
+            let _ = self.tx.send(Ev::Hotkey(id));
+            return;
+        }
+        let mut st = self.st.lock().unwrap();
+        let st = &mut *st;
+        match ev {
+            CapEvent::Button { button, down } => {
+                if down {
+                    st.phys_buttons |= button.bit();
+                } else {
+                    st.phys_buttons &= !button.bit();
+                }
+            }
+            CapEvent::Motion { .. } => st.last_phys_motion = Some(Instant::now()),
+            _ => {}
+        }
+        match st.mode.clone() {
+            Mode::Local => {
+                if let CapEvent::Motion { dx, dy } = ev {
+                    if st.disabled || st.links.is_empty() {
+                        return;
+                    }
+                    self.check_edges(st, dx, dy, cursor);
+                }
+            }
+            Mode::Hosted { .. } => {}
+            Mode::Remote { peer, .. } => {
+                match ev {
+                    CapEvent::Motion { dx, dy } => {
+                        st.src.cum_dx = st.src.cum_dx.wrapping_add(dx);
+                        st.src.cum_dy = st.src.cum_dy.wrapping_add(dy);
+                    }
+                    CapEvent::Button { button, down } => {
+                        st.ev_seq += 1;
+                        let e = ButtonEvent { seq: st.ev_seq, button: button as u8, down, cum_dx: st.src.cum_dx, cum_dy: st.src.cum_dy };
+                        if st.src.events.len() == EVENT_RING {
+                            st.src.events.remove(0);
+                        }
+                        st.src.events.push(e);
+                        if down {
+                            st.src.buttons |= button.bit();
+                        } else {
+                            st.src.buttons &= !button.bit();
+                        }
+                    }
+                    CapEvent::Wheel { v, h } => {
+                        st.src.cum_wheel_v = st.src.cum_wheel_v.wrapping_add(v);
+                        st.src.cum_wheel_h = st.src.cum_wheel_h.wrapping_add(h);
+                    }
+                    CapEvent::Hotkey { .. } => {}
+                }
+                self.send_input(st, &peer);
+                // Emergency chord: left+right+middle held.
+                let chord = Button::Left.bit() | Button::Right.bit() | Button::Middle.bit();
+                let chord_ms = self.cfg.read().unwrap().switching.chord_release_ms;
+                if chord_ms > 0 && st.phys_buttons & chord == chord {
+                    let since = *st.chord_since.get_or_insert_with(Instant::now);
+                    if since.elapsed() >= Duration::from_millis(chord_ms) {
+                        st.chord_since = None;
+                        self.end_remote(st, "emergency mouse chord", None);
+                    }
+                } else {
+                    st.chord_since = None;
+                }
+            }
+        }
+        let mut s = self.stats.lock().unwrap();
+        s.capture_rate.tick();
+        s.capture_cost.add(t0.elapsed().as_micros() as u64);
+    }
+
+    fn check_edges(&self, st: &mut State, dx: i32, dy: i32, cursor: (i32, i32)) {
+        let (resistance, deadzone, lock) = {
+            let c = self.cfg.read().unwrap();
+            (c.switching.edge_resistance, c.switching.corner_deadzone, c.switching.lock_while_button_held)
+        };
+        let screens = self.screens.read().unwrap();
+        let mut hit = None;
+        for (i, (link, seg)) in st.links.iter().enumerate() {
+            let pos = geom::on_edge(&screens, seg, link.edge, cursor.0, cursor.1, deadzone);
+            let out = geom::outward(link.edge, dx, dy);
+            let push = st.push.entry(i).or_default();
+            if push.feed(pos.is_some(), out, resistance) {
+                hit = Some((link.clone(), *seg, pos.unwrap()));
+                break;
+            }
+        }
+        drop(screens);
+        let Some((link, seg, pos)) = hit else { return };
+        if lock && st.phys_buttons != 0 {
+            return;
+        }
+        #[cfg(windows)]
+        if platform::os::cursor_clipped() {
+            return; // fullscreen game or app has confined the cursor
+        }
+        let Some(peer) = self.peer_by_name(&link.peer) else { return };
+        self.begin_remote(st, peer, link.edge, seg, pos, cursor, "edge");
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn begin_remote(&self, st: &mut State, peer: Arc<Peer>, edge: Edge, seg: Rect, pos: f32, park: (i32, i32), reason: &str) {
+        if peer.info.lock().unwrap().udp_addr.is_none() {
+            log::warn!("cannot switch to {}: no hello yet", peer.name());
+            return;
+        }
+        let epoch = st.next_epoch;
+        st.next_epoch = st.next_epoch.wrapping_add(1);
+        st.src = InputState { epoch, ..Default::default() };
+        st.ev_seq = 0;
+        st.last_ack = Instant::now();
+        st.mode = Mode::Remote { peer: peer.clone(), epoch, exit_edge: edge, exit_seg: seg };
+        if let Some(c) = self.capture.get() {
+            c.set_forwarding(true, park);
+        }
+        log::info!("→ {} ({reason}, epoch {epoch})", peer.name());
+        {
+            let mut s = self.stats.lock().unwrap();
+            s.switches += 1;
+            s.last_switch_reason = reason.into();
+        }
+        let _ = self.tx.send(Ev::SendEnter(peer.clone(), epoch, edge, pos));
+        self.switch_monitor_to(Some(&peer));
+        self.send_input(st, &peer);
+    }
+
+    /// Return pointer control to this machine.
+    fn end_remote(&self, st: &mut State, reason: &str, leave: Option<f32>) {
+        let Mode::Remote { peer, epoch, exit_edge, exit_seg } = st.mode.clone() else { return };
+        st.mode = Mode::Local;
+        st.push.values_mut().for_each(|p| p.reset());
+        let target = leave.map(|pos| geom::entry_point(&exit_seg, exit_edge, pos));
+        if let Some(c) = self.capture.get() {
+            c.set_forwarding(false, target.unwrap_or((0, 0)));
+        }
+        if let Some((x, y)) = target {
+            let _ = self.inj.lock().unwrap().warp(x, y);
+        }
+        if leave.is_none() {
+            // Tell the sink to release everything (best effort, also over UDP via buttons=0).
+            st.src.buttons = 0;
+            self.send_input(st, &peer);
+            let p = peer.clone();
+            std::thread::spawn(move || p.send(Ctrl::Revoke { epoch }));
+        }
+        log::info!("← local ({reason})");
+        {
+            let mut s = self.stats.lock().unwrap();
+            s.switches += 1;
+            s.last_switch_reason = reason.into();
+        }
+        self.switch_monitor_to(None);
+    }
+
+    fn send_input(&self, st: &mut State, peer: &Peer) {
+        let (addr, send_id) = {
+            let i = peer.info.lock().unwrap();
+            match i.udp_addr {
+                Some(a) => (a, i.send_id),
+                None => return,
+            }
+        };
+        st.src.t_us = now_us();
+        st.src.encode(&mut st.enc);
+        if peer.sess.seal_udp(send_id, &st.enc, &mut st.dgram).is_ok() {
+            if let Some(p) = std::env::var("SWITCHBOARD_TEST_DROP").ok().and_then(|v| v.parse::<u64>().ok()) {
+                // Test hook: deterministically drop every p-th datagram.
+                if p > 0 && self.seq_drop.fetch_add(1, Ordering::Relaxed) % p == 0 {
+                    st.last_send = Instant::now();
+                    return;
+                }
+            }
+            let _ = self.udp.send_to(&st.dgram, addr);
+            st.sent += 1;
+            st.last_send = Instant::now();
+            self.stats.lock().unwrap().send_rate.tick();
+        }
+    }
+
+    fn switch_monitor_to(&self, peer: Option<&Peer>) {
+        if !self.cfg.read().unwrap().monitor.enabled {
+            return;
+        }
+        let ms = self.monitor.status();
+        if ms.model.is_empty() {
+            return;
+        }
+        let target = match peer {
+            None => ms.local_input,
+            Some(p) => {
+                let i = p.info.lock().unwrap();
+                let same = !i.monitor_model.is_empty() && (i.monitor_model.contains(&ms.model) || ms.model.contains(&i.monitor_model) || model_core(&i.monitor_model) == model_core(&ms.model));
+                if same {
+                    i.monitor_input
+                } else {
+                    None
+                }
+            }
+        };
+        if let Some(t) = target {
+            self.monitor.request(t);
+        }
+    }
+
+    // ------------------------------------------------------------ UDP
+
+    fn udp_loop(self: Arc<Self>) {
+        let mut buf = vec![0u8; 2048];
+        let mut plain = Vec::with_capacity(2048);
+        loop {
+            let (n, from) = match self.udp.recv_from(&mut buf) {
+                Ok(x) => x,
+                Err(e) => {
+                    // Windows reports ICMP port-unreachable as ConnectionReset on UDP sockets.
+                    if e.kind() != std::io::ErrorKind::ConnectionReset {
+                        log::debug!("udp recv: {e}");
+                    }
+                    continue;
+                }
+            };
+            self.on_datagram(&buf[..n], from, &mut plain);
+        }
+    }
+
+    fn on_datagram(&self, d: &[u8], from: SocketAddr, plain: &mut Vec<u8>) {
+        let rx_at = Instant::now();
+        let Some(sid) = net::udp_session_id(d) else { return };
+        let peer = self.peers.read().unwrap().iter().find(|p| p.recv_id == sid).cloned();
+        let Some(peer) = peer else { return };
+        let Some(seq) = peer.sess.open_udp(d, plain) else {
+            self.stats.lock().unwrap().udp_bad += 1;
+            return;
+        };
+        self.stats.lock().unwrap().udp_rx += 1;
+        if !peer.trusted.load(Ordering::Relaxed) {
+            return;
+        }
+        // Roaming: authenticated datagram from a new address (DHCP renewal etc).
+        {
+            let mut i = peer.info.lock().unwrap();
+            if let Some(a) = i.udp_addr {
+                if a.ip() != from.ip() {
+                    log::info!("peer {} moved to {}", peer.fp, from.ip());
+                    i.udp_addr = Some(SocketAddr::new(from.ip(), a.port()));
+                }
+            }
+        }
+        if let Some(s) = InputState::decode(plain) {
+            self.on_input(&peer, s, seq, rx_at);
+        } else if let Some(a) = InputAck::decode(plain) {
+            self.on_ack(&peer, a);
+        }
+    }
+
+    fn on_ack(&self, peer: &Arc<Peer>, a: InputAck) {
+        let rtt = now_us().saturating_sub(a.echo_t_us);
+        peer.info.lock().unwrap().rtt.add(rtt);
+        let mut st = self.st.lock().unwrap();
+        if let Mode::Remote { peer: p, epoch, .. } = &st.mode {
+            if Arc::ptr_eq(p, peer) && *epoch == a.epoch {
+                st.last_ack = Instant::now();
+            }
+        }
+        drop(st);
+        self.stats.lock().unwrap().acks += 1;
+    }
+
+    fn on_input(&self, peer: &Arc<Peer>, s: InputState, seq: u64, rx_at: Instant) {
+        let mut st = self.st.lock().unwrap();
+        let st = &mut *st;
+        let Mode::Hosted { peer: p, epoch } = &st.mode else { return };
+        if !Arc::ptr_eq(p, peer) || *epoch != s.epoch {
+            return;
+        }
+        let deadzone;
+        let resistance;
+        {
+            let c = self.cfg.read().unwrap();
+            deadzone = c.switching.corner_deadzone;
+            resistance = c.switching.edge_resistance;
+        }
+        let sk = &mut st.sink;
+        if sk.last_seq != 0 && seq > sk.last_seq + 1 {
+            self.stats.lock().unwrap().sink_lost_seq += seq - sk.last_seq - 1;
+        }
+        sk.last_seq = seq;
+        sk.last_echo = s.t_us;
+        sk.last_rx = Some(rx_at);
+        sk.received += 1;
+        let t_inj = Instant::now();
+        let mut inj = self.inj.lock().unwrap();
+        let mut moved = (0, 0);
+        // 1. Button transitions in order, each at its recorded motion position.
+        let seen = sk.ev_seq;
+        for e in s.events.iter().filter(|e| e.seq > seen) {
+            let (dx, dy) = (e.cum_dx.wrapping_sub(sk.cum_dx), e.cum_dy.wrapping_sub(sk.cum_dy));
+            if dx != 0 || dy != 0 {
+                let _ = inj.motion(dx, dy);
+                moved.0 += dx;
+                moved.1 += dy;
+            }
+            sk.cum_dx = e.cum_dx;
+            sk.cum_dy = e.cum_dy;
+            if let Some(b) = Button::from_u8(e.button) {
+                let _ = inj.button(b, e.down);
+                if e.down {
+                    sk.pressed |= b.bit();
+                } else {
+                    sk.pressed &= !b.bit();
+                }
+            }
+            sk.ev_seq = e.seq;
+        }
+        // 2. Remaining motion and wheel.
+        let (dx, dy) = (s.cum_dx.wrapping_sub(sk.cum_dx), s.cum_dy.wrapping_sub(sk.cum_dy));
+        if dx != 0 || dy != 0 {
+            let _ = inj.motion(dx, dy);
+            moved.0 += dx;
+            moved.1 += dy;
+        }
+        sk.cum_dx = s.cum_dx;
+        sk.cum_dy = s.cum_dy;
+        let (wv, wh) = (s.cum_wheel_v.wrapping_sub(sk.wv), s.cum_wheel_h.wrapping_sub(sk.wh));
+        if wv != 0 || wh != 0 {
+            let _ = inj.wheel(wv, wh);
+        }
+        sk.wv = s.cum_wheel_v;
+        sk.wh = s.cum_wheel_h;
+        // 3. Reconcile with authoritative button state (covers ring overflow).
+        if sk.pressed != s.buttons {
+            for b in Button::ALL {
+                let want = s.buttons & b.bit() != 0;
+                if (sk.pressed & b.bit() != 0) != want {
+                    let _ = inj.button(b, want);
+                }
+            }
+            sk.pressed = s.buttons;
+        }
+        let flush = inj.flush();
+        if let Err(e) = flush {
+            log::debug!("inject: {e}");
+        }
+        sk.inject.add(t_inj.elapsed().as_micros() as u64);
+        // 4. Return edge?
+        let mut leave = None;
+        if let (Some(edge), true) = (sk.ret_edge, moved != (0, 0)) {
+            if let Some((x, y)) = inj.cursor_pos() {
+                let screens = self.screens.read().unwrap();
+                let pos = geom::on_edge(&screens, &sk.ret_seg, edge, x, y, deadzone);
+                let out = geom::outward(edge, moved.0, moved.1);
+                if sk.push.feed(pos.is_some(), out, resistance) && sk.pressed == 0 {
+                    leave = Some((edge, pos.unwrap()));
+                }
+            }
+        }
+        drop(inj);
+        let epoch = s.epoch;
+        if let Some((edge, pos)) = leave {
+            st.mode = Mode::Local;
+            let _ = self.tx.send(Ev::SendLeave(peer.clone(), epoch, edge, pos));
+        }
+        // 5. Ack (throttled).
+        let sk = &mut st.sink;
+        if sk.last_ack.is_none_or(|t| t.elapsed() >= ACK_INTERVAL) || leave.is_some() {
+            sk.last_ack = Some(Instant::now());
+            let a = InputAck {
+                epoch,
+                seq,
+                echo_t_us: sk.last_echo,
+                hold_us: rx_at.elapsed().as_micros() as u32,
+                inject_us: sk.inject.percentile(50.0) as u32,
+                received: sk.received,
+            };
+            self.send_ack(peer, &a);
+        }
+    }
+
+    fn send_ack(&self, peer: &Peer, a: &InputAck) {
+        let (addr, send_id) = {
+            let i = peer.info.lock().unwrap();
+            match i.udp_addr {
+                Some(x) => (x, i.send_id),
+                None => return,
+            }
+        };
+        let mut p = Vec::with_capacity(64);
+        a.encode(&mut p);
+        let mut d = Vec::with_capacity(96);
+        if peer.sess.seal_udp(send_id, &p, &mut d).is_ok() {
+            let _ = self.udp.send_to(&d, addr);
+        }
+    }
+
+    fn release_all_injected(&self, st: &mut State) {
+        let pressed = std::mem::take(&mut st.sink.pressed);
+        if pressed != 0 {
+            let mut inj = self.inj.lock().unwrap();
+            for b in Button::ALL {
+                if pressed & b.bit() != 0 {
+                    let _ = inj.button(b, false);
+                }
+            }
+            let _ = inj.flush();
+            log::info!("released stuck buttons {pressed:#b}");
+        }
+    }
+
+    // ------------------------------------------------------------ engine thread
+
+    pub fn run(self: &Arc<Self>, rx: Receiver<Ev>) {
+        let mut last_ping = Instant::now();
+        let mut last_dial = Instant::now() - Duration::from_secs(10);
+        let mut last_screen_scan = Instant::now();
+        loop {
+            match rx.recv_timeout(Duration::from_millis(10)) {
+                Ok(ev) => self.handle(ev),
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => return,
+            }
+            if self.shutting_down.load(Ordering::Relaxed) {
+                return;
+            }
+            self.tick();
+            if last_ping.elapsed() >= PING_INTERVAL {
+                last_ping = Instant::now();
+                for p in self.peers.read().unwrap().clone() {
+                    if p.alive.load(Ordering::Relaxed) {
+                        let p2 = p.clone();
+                        std::thread::spawn(move || p2.send(Ctrl::Ping { t_us: now_us() }));
+                        if !p.trusted.load(Ordering::Relaxed) && p.connected_at.elapsed() > PAIR_TIMEOUT {
+                            log::info!("pairing with {} timed out", p.fp);
+                            p.alive.store(false, Ordering::Relaxed);
+                            p.sess.shutdown();
+                        }
+                    }
+                }
+            }
+            if last_dial.elapsed() >= Duration::from_secs(2) {
+                last_dial = Instant::now();
+                self.reconnect();
+            }
+            if last_screen_scan.elapsed() >= Duration::from_secs(3) {
+                last_screen_scan = Instant::now();
+                self.rescan_screens();
+            }
+        }
+    }
+
+    fn tick(&self) {
+        let timeout = Duration::from_millis(self.cfg.read().unwrap().switching.peer_timeout_ms);
+        let mut st = self.st.lock().unwrap();
+        let st = &mut *st;
+        match st.mode.clone() {
+            Mode::Remote { peer, .. } => {
+                if !peer.alive.load(Ordering::Relaxed) {
+                    self.end_remote(st, "peer disconnected", None);
+                } else if st.last_ack.elapsed() > timeout {
+                    self.end_remote(st, "peer stopped responding", None);
+                } else if st.last_send.elapsed() >= KEEPALIVE {
+                    self.send_input(st, &peer);
+                }
+            }
+            Mode::Hosted { peer, .. } => {
+                if !peer.alive.load(Ordering::Relaxed) {
+                    self.release_all_injected(st);
+                    st.mode = Mode::Local;
+                    log::info!("controller {} disconnected; local control", peer.fp);
+                } else if st.sink.last_rx.is_some_and(|t| t.elapsed() > SINK_IDLE_RELEASE) {
+                    self.release_all_injected(st);
+                }
+            }
+            Mode::Local => {}
+        }
+    }
+
+    fn reconnect(self: &Arc<Self>) {
+        let cfg = self.cfg.read().unwrap().clone();
+        let connected: Vec<String> = self.peers.read().unwrap().iter().filter(|p| p.alive.load(Ordering::Relaxed)).map(|p| p.key_hex.clone()).collect();
+        let disc = self.discovered.lock().unwrap().clone();
+        for pc in &cfg.peers {
+            if connected.contains(&pc.key) {
+                continue;
+            }
+            let mut addrs: Vec<SocketAddr> = vec![];
+            if let Some((a, _, seen)) = disc.get(&pc.key) {
+                if seen.elapsed() < Duration::from_secs(30) {
+                    addrs.push(*a);
+                }
+            }
+            if let Some(a) = &pc.address {
+                if let Some(sa) = parse_addr(a, cfg.port) {
+                    if !addrs.contains(&sa) {
+                        addrs.push(sa);
+                    }
+                }
+            }
+            for a in addrs {
+                let k = format!("{}@{}", pc.key, a);
+                let mut d = self.dialing.lock().unwrap();
+                if d.get(&k).is_some_and(|t| t.elapsed() < Duration::from_secs(2)) {
+                    continue;
+                }
+                d.insert(k, Instant::now());
+                drop(d);
+                self.dial(a);
+            }
+        }
+    }
+
+    fn handle(self: &Arc<Self>, ev: Ev) {
+        match ev {
+            Ev::Connected => {}
+            Ev::Closed(p) => {
+                self.peers.write().unwrap().retain(|q| !Arc::ptr_eq(q, &p));
+                self.tick();
+            }
+            Ev::SendEnter(p, epoch, edge, pos) => p.send(Ctrl::Enter { epoch, edge, pos }),
+            Ev::SendLeave(p, epoch, edge, pos) => {
+                {
+                    let mut st = self.st.lock().unwrap();
+                    self.release_all_injected(&mut st);
+                }
+                p.send(Ctrl::Leave { epoch, edge, pos });
+                log::info!("pointer returned to {}", p.name());
+            }
+            Ev::Hotkey(id) => self.on_hotkey(id),
+            Ev::Ipc(req, reply) => {
+                let r = crate::ipc::handle(self, req);
+                let _ = reply.send(r);
+            }
+            Ev::Discovered { key_hex, addr, name } => {
+                let mut d = self.discovered.lock().unwrap();
+                let new = !d.contains_key(&key_hex);
+                d.insert(key_hex.clone(), (addr, name.clone(), Instant::now()));
+                drop(d);
+                if new {
+                    log::info!("discovered {name} at {addr}");
+                    if self.cfg.read().unwrap().peer_by_key(&key_hex).is_some() {
+                        self.reconnect();
+                    }
+                }
+            }
+            Ev::Frame(p, f) => match f {
+                Frame::Ctrl(m) => self.on_ctrl(&p, m),
+                Frame::Data { id, last, bytes } => {
+                    if p.trusted.load(Ordering::Relaxed) {
+                        if let Some(c) = self.clip.get() {
+                            c.on_data(&p, id, last, bytes);
+                        }
+                    }
+                }
+            },
+        }
+    }
+
+    fn on_hotkey(self: &Arc<Self>, id: u32) {
+        let mut st = self.st.lock().unwrap();
+        let st = &mut *st;
+        match id {
+            HOTKEY_EMERGENCY => {
+                match st.mode.clone() {
+                    Mode::Remote { .. } => self.end_remote(st, "emergency hotkey", None),
+                    Mode::Hosted { peer, .. } => {
+                        self.release_all_injected(st);
+                        st.mode = Mode::Local;
+                        let p = peer.clone();
+                        std::thread::spawn(move || p.send(Ctrl::RequestFocus { target: Focus::You }));
+                    }
+                    Mode::Local => {}
+                }
+                st.disabled = true;
+                log::warn!("EMERGENCY: forwarding disabled. Press the toggle hotkey or use the app to re-enable.");
+            }
+            HOTKEY_TOGGLE => {
+                if st.disabled {
+                    st.disabled = false;
+                    log::info!("forwarding re-enabled");
+                }
+                match st.mode.clone() {
+                    Mode::Remote { .. } => self.end_remote(st, "hotkey", Some(0.5)),
+                    Mode::Hosted { peer, .. } => {
+                        let p = peer.clone();
+                        std::thread::spawn(move || p.send(Ctrl::RequestFocus { target: Focus::You }));
+                    }
+                    Mode::Local => {
+                        let Some(peer) = self.trusted_peers().into_iter().next() else { return };
+                        let has_pointer = st.last_phys_motion.is_some_and(|t| t.elapsed() < Duration::from_secs(60));
+                        if has_pointer {
+                            let screens = self.screens.read().unwrap().clone();
+                            let (edge, seg) = st.links.iter().find(|(l, _)| l.peer == peer.name()).map(|(l, r)| (l.edge, *r)).unwrap_or((Edge::Right, geom::desktop(&screens)));
+                            let park = geom::entry_point(&seg, edge, 0.5);
+                            self.begin_remote(st, peer, edge, seg, 0.5, park, "hotkey");
+                        } else {
+                            let p = peer.clone();
+                            std::thread::spawn(move || p.send(Ctrl::RequestFocus { target: Focus::Me }));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn on_ctrl(self: &Arc<Self>, p: &Arc<Peer>, m: Ctrl) {
+        let trusted = p.trusted.load(Ordering::Relaxed);
+        match m {
+            Ctrl::Hello { version, name, os, udp_port, udp_session, screens, monitor_model, monitor_input } => {
+                if version != PROTOCOL_VERSION {
+                    log::warn!("peer {} speaks protocol v{version}, we speak v{PROTOCOL_VERSION}", p.fp);
+                }
+                let mut i = p.info.lock().unwrap();
+                if !trusted || i.name.is_empty() {
+                    i.name = name;
+                }
+                i.os = os;
+                i.udp_addr = Some(SocketAddr::new(p.sess.peer_addr.ip(), udp_port));
+                i.send_id = udp_session;
+                i.screens = screens;
+                i.monitor_model = monitor_model;
+                i.monitor_input = monitor_input;
+                i.hello = true;
+                log::info!("hello from {} ({}), monitor {:?} input {:?}", i.name, i.os, i.monitor_model, i.monitor_input.map(crate::config::input_name));
+                drop(i);
+                if trusted {
+                    if let Some(c) = self.clip.get() {
+                        c.on_peer_ready(p);
+                    }
+                }
+            }
+            Ctrl::Ping { t_us } => {
+                let p = p.clone();
+                std::thread::spawn(move || p.send(Ctrl::Pong { t_us }));
+            }
+            Ctrl::Pong { t_us } => {
+                p.info.lock().unwrap().rtt.add(now_us().saturating_sub(t_us));
+            }
+            Ctrl::PairPending => {}
+            Ctrl::PairConfirm { accept } => {
+                if !accept {
+                    log::info!("{} rejected pairing", p.fp);
+                    p.alive.store(false, Ordering::Relaxed);
+                    p.sess.shutdown();
+                    return;
+                }
+                p.pair_remote.store(true, Ordering::Relaxed);
+                self.maybe_finish_pairing(p);
+            }
+            Ctrl::Bye => {
+                p.alive.store(false, Ordering::Relaxed);
+                p.sess.shutdown();
+            }
+            _ if !trusted => log::warn!("ignoring message from unpaired device {}", p.fp),
+            Ctrl::Enter { epoch, edge, pos } => {
+                let mut st = self.st.lock().unwrap();
+                let st = &mut *st;
+                if st.disabled {
+                    let p = p.clone();
+                    std::thread::spawn(move || p.send(Ctrl::Leave { epoch, edge: edge.opposite(), pos }));
+                    return;
+                }
+                if let Mode::Remote { peer, .. } = &st.mode {
+                    // Both sides crossed at once: the smaller fingerprint stays source.
+                    if Arc::ptr_eq(peer, p) && self.fp < p.fp {
+                        let p = p.clone();
+                        std::thread::spawn(move || p.send(Ctrl::Leave { epoch, edge: edge.opposite(), pos }));
+                        return;
+                    }
+                    self.end_remote(st, "peer took control", None);
+                }
+                let screens = self.screens.read().unwrap().clone();
+                let (ret_edge, seg) = st.links.iter().find(|(l, _)| l.peer == p.name()).map(|(l, r)| (l.edge, *r)).unwrap_or_else(|| (edge.opposite(), geom::desktop(&screens)));
+                st.sink = SinkState { ret_edge: Some(ret_edge), ret_seg: seg, ..Default::default() };
+                st.mode = Mode::Hosted { peer: p.clone(), epoch };
+                let (x, y) = geom::entry_point(&seg, ret_edge, pos);
+                let _ = self.inj.lock().unwrap().warp(x, y);
+                log::info!("pointer from {} entered at ({x},{y}) via {ret_edge:?}", p.name());
+                self.stats.lock().unwrap().switches += 1;
+            }
+            Ctrl::Leave { epoch, edge: _, pos } => {
+                let mut st = self.st.lock().unwrap();
+                if let Mode::Remote { peer, epoch: e, .. } = &st.mode {
+                    if Arc::ptr_eq(peer, p) && *e == epoch {
+                        self.end_remote(&mut st, "edge", Some(pos));
+                    }
+                }
+            }
+            Ctrl::Revoke { epoch } => {
+                let mut st = self.st.lock().unwrap();
+                if let Mode::Hosted { peer, epoch: e } = &st.mode {
+                    if Arc::ptr_eq(peer, p) && *e == epoch {
+                        self.release_all_injected(&mut st);
+                        st.mode = Mode::Local;
+                        log::info!("{} took the pointer back", p.name());
+                    }
+                }
+            }
+            Ctrl::RequestFocus { target } => {
+                let mut st = self.st.lock().unwrap();
+                let st = &mut *st;
+                match (target, st.mode.clone()) {
+                    // Peer wants the pointer back from us (we control it): stop.
+                    (Focus::You, Mode::Remote { peer, .. }) if Arc::ptr_eq(&peer, p) => self.end_remote(st, "peer requested", Some(0.5)),
+                    // Peer wants our pointer on their machine.
+                    (Focus::Me, Mode::Local) if !st.disabled => {
+                        let screens = self.screens.read().unwrap().clone();
+                        let (edge, seg) = st.links.iter().find(|(l, _)| l.peer == p.name()).map(|(l, r)| (l.edge, *r)).unwrap_or((Edge::Right, geom::desktop(&screens)));
+                        let park = geom::entry_point(&seg, edge, 0.5);
+                        self.begin_remote(st, p.clone(), edge, seg, 0.5, park, "peer hotkey");
+                    }
+                    _ => {}
+                }
+            }
+            Ctrl::MonitorSet { input, req } => {
+                let model = self.monitor.status().model;
+                let p = p.clone();
+                std::thread::spawn(move || {
+                    let r = crate::ddc::set_input(&model, input);
+                    p.send(Ctrl::MonitorResult { req, ok: r.is_ok(), detail: r.err().map(|e| e.to_string()).unwrap_or_default() });
+                });
+            }
+            Ctrl::MonitorResult { ok, detail, .. } => {
+                if !ok {
+                    log::warn!("peer could not switch monitor: {detail}");
+                }
+            }
+            m @ (Ctrl::ClipOffer { .. } | Ctrl::ClipRequest { .. } | Ctrl::ClipData { .. } | Ctrl::ClipError { .. }) => {
+                if let Some(c) = self.clip.get() {
+                    c.on_ctrl(p, m);
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------ pairing
+
+    pub fn confirm_pairing(&self, fp: Option<&str>, accept: bool) -> Result<String, String> {
+        let peers = self.peers.read().unwrap().clone();
+        let cand: Vec<_> = peers.iter().filter(|p| !p.trusted.load(Ordering::Relaxed) && p.alive.load(Ordering::Relaxed) && fp.is_none_or(|f| p.fp == f || p.sess.sas.replace(' ', "") == f.replace(' ', ""))).collect();
+        let p = match cand.len() {
+            0 => return Err("no pending pairing".into()),
+            1 => cand[0].clone(),
+            _ => return Err("several pending pairings; specify the code".into()),
+        };
+        p.send(Ctrl::PairConfirm { accept });
+        if !accept {
+            p.alive.store(false, Ordering::Relaxed);
+            p.sess.shutdown();
+            return Ok("rejected".into());
+        }
+        p.pair_local.store(true, Ordering::Relaxed);
+        self.maybe_finish_pairing(&p);
+        Ok(if p.trusted.load(Ordering::Relaxed) { format!("paired with {}", p.name()) } else { "confirmed here; waiting for the other computer".into() })
+    }
+
+    fn maybe_finish_pairing(&self, p: &Arc<Peer>) {
+        if !(p.pair_local.load(Ordering::Relaxed) && p.pair_remote.load(Ordering::Relaxed)) || p.trusted.load(Ordering::Relaxed) {
+            return;
+        }
+        let name = p.name();
+        {
+            let mut cfg = self.cfg.write().unwrap();
+            cfg.peers.retain(|q| q.key != p.key_hex);
+            let address = Some(p.sess.peer_addr.ip().to_string());
+            cfg.peers.push(PeerConfig { name: name.clone(), key: p.key_hex.clone(), address });
+            if let Err(e) = cfg.save() {
+                log::error!("saving config: {e}");
+            }
+        }
+        p.trusted.store(true, Ordering::Relaxed);
+        log::info!("paired with {name} ({})", p.fp);
+        // Re-send hello now that we trust each other (name, udp etc. were already exchanged).
+        let mut h = self.hello();
+        if let Ctrl::Hello { udp_session, .. } = &mut h {
+            *udp_session = p.recv_id;
+        }
+        p.send(h);
+    }
+
+    // ------------------------------------------------------------ status / IPC helpers
+
+    pub fn status(&self) -> Value {
+        let st = self.st.lock().unwrap();
+        let stats = self.stats.lock().unwrap();
+        let (cpu, mem) = crate::stats::process_stats();
+        let peers: Vec<Value> = self
+            .peers
+            .read()
+            .unwrap()
+            .iter()
+            .filter(|p| p.alive.load(Ordering::Relaxed))
+            .map(|p| {
+                let i = p.info.lock().unwrap();
+                json!({
+                    "name": if i.name.is_empty() { p.fp.clone() } else { i.name.clone() },
+                    "fingerprint": p.fp,
+                    "address": p.sess.peer_addr.to_string(),
+                    "os": i.os,
+                    "trusted": p.trusted.load(Ordering::Relaxed),
+                    "pairing_code": (!p.trusted.load(Ordering::Relaxed)).then(|| p.sess.sas.clone()),
+                    "confirmed_here": p.pair_local.load(Ordering::Relaxed),
+                    "rtt_ms": { "p50": i.rtt.percentile(50.0) as f64 / 1000.0, "p95": i.rtt.percentile(95.0) as f64 / 1000.0, "p99": i.rtt.percentile(99.0) as f64 / 1000.0, "samples": i.rtt.len() },
+                    "monitor_input": i.monitor_input.map(crate::config::input_name),
+                    "screens": i.screens,
+                    "connected_s": p.connected_at.elapsed().as_secs(),
+                })
+            })
+            .collect();
+        let disc: Vec<Value> = self.discovered.lock().unwrap().iter().filter(|(_, v)| v.2.elapsed() < Duration::from_secs(30)).map(|(k, v)| json!({"name": v.1, "address": v.0.to_string(), "fingerprint": net::unhex(k).map(|k| net::fingerprint(&k)), "paired": self.cfg.read().unwrap().peer_by_key(k).is_some()})).collect();
+        let cfg = self.cfg.read().unwrap();
+        json!({
+            "name": cfg.name,
+            "fingerprint": self.fp,
+            "version": env!("CARGO_PKG_VERSION"),
+            "os": std::env::consts::OS,
+            "mode": st.mode.label(),
+            "disabled": st.disabled,
+            "uptime_s": self.started.elapsed().as_secs(),
+            "screens": *self.screens.read().unwrap(),
+            "links": cfg.links,
+            "peers": peers,
+            "discovered": disc,
+            "monitor": self.monitor.status(),
+            "capture": self.capture.get().is_some(),
+            "injector": self.inj.lock().unwrap().name(),
+            "stats": {
+                "capture_events_per_s": stats.capture_rate.rate(),
+                "datagrams_sent_per_s": stats.send_rate.rate(),
+                "capture_handler_us_p50": stats.capture_cost.percentile(50.0),
+                "capture_handler_us_p99": stats.capture_cost.percentile(99.0),
+                "sink_inject_us_p50": st.sink.inject.percentile(50.0),
+                "sink_inject_us_p99": st.sink.inject.percentile(99.0),
+                "sink_received": st.sink.received,
+                "sink_gaps": stats.sink_lost_seq,
+                "udp_rx": stats.udp_rx,
+                "udp_rejected": stats.udp_bad,
+                "acks": stats.acks,
+                "switches": stats.switches,
+                "last_switch_reason": stats.last_switch_reason,
+                "cpu_s": cpu,
+                "rss_bytes": mem,
+            }
+        })
+    }
+
+    pub fn set_disabled(&self, d: bool) {
+        let mut st = self.st.lock().unwrap();
+        if d {
+            if matches!(st.mode, Mode::Remote { .. }) {
+                self.end_remote(&mut st, "disabled", None);
+            }
+        }
+        st.disabled = d;
+    }
+
+    pub fn switch_to(self: &Arc<Self>, target: &str) -> Result<String, String> {
+        let mut st = self.st.lock().unwrap();
+        let st = &mut *st;
+        if target == "local" || target == self.cfg.read().unwrap().name {
+            match st.mode.clone() {
+                Mode::Remote { .. } => self.end_remote(st, "manual", Some(0.5)),
+                Mode::Hosted { peer, .. } => {
+                    let p = peer.clone();
+                    std::thread::spawn(move || p.send(Ctrl::RequestFocus { target: Focus::You }));
+                }
+                Mode::Local => {}
+            }
+            return Ok("local".into());
+        }
+        let peer = self.peer_by_name(target).ok_or_else(|| format!("no connected peer named {target:?}"))?;
+        if let Mode::Remote { .. } = st.mode {
+            self.end_remote(st, "manual", None);
+        }
+        let screens = self.screens.read().unwrap().clone();
+        let (edge, seg) = st.links.iter().find(|(l, _)| l.peer == peer.name()).map(|(l, r)| (l.edge, *r)).unwrap_or((Edge::Right, geom::desktop(&screens)));
+        let park = geom::entry_point(&seg, edge, 0.5);
+        self.begin_remote(st, peer.clone(), edge, seg, 0.5, park, "manual");
+        Ok(format!("controlling {}", peer.name()))
+    }
+
+    pub fn reload_config(&self) {
+        let c = Config::load();
+        *self.cfg.write().unwrap() = c;
+        self.refresh_links();
+    }
+
+    pub fn shutdown(&self) {
+        self.shutting_down.store(true, Ordering::Relaxed);
+        let mut st = self.st.lock().unwrap();
+        match st.mode.clone() {
+            Mode::Remote { .. } => self.end_remote(&mut st, "shutdown", None),
+            Mode::Hosted { .. } => {
+                self.release_all_injected(&mut st);
+                st.mode = Mode::Local;
+            }
+            Mode::Local => {}
+        }
+        drop(st);
+        for p in self.peers.read().unwrap().iter() {
+            p.send(Ctrl::Bye);
+        }
+    }
+
+    pub fn discovered_peer(&self, key_hex: String, addr: SocketAddr, name: String) {
+        let _ = self.tx.send(Ev::Discovered { key_hex, addr, name });
+    }
+}
+
+fn model_core(s: &str) -> String {
+    // "Alienware_AW2726DM(DisplayPort)" / "AW2726DM" -> "AW2726DM"
+    s.split(|c: char| !c.is_ascii_alphanumeric()).filter(|w| w.len() >= 5 && w.chars().any(|c| c.is_ascii_digit())).last().unwrap_or(s).to_string()
+}
+
+pub fn parse_addr(a: &str, default_port: u16) -> Option<SocketAddr> {
+    a.parse::<SocketAddr>().ok().or_else(|| a.parse::<IpAddr>().ok().map(|ip| SocketAddr::new(ip, default_port)))
+}
+
+/// Private/link-local/loopback only — the control service is never meant to
+/// be reachable from the internet.
+pub fn is_local_net(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v) => v.is_private() || v.is_loopback() || v.is_link_local(),
+        IpAddr::V6(v) => v.is_loopback() || (v.segments()[0] & 0xffc0) == 0xfe80 || (v.segments()[0] & 0xfe00) == 0xfc00 || v.to_ipv4_mapped().is_some_and(|v4| v4.is_private() || v4.is_loopback()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn model_matching() {
+        assert_eq!(model_core("Alienware_AW2726DM(DisplayPort)"), "AW2726DM");
+        assert_eq!(model_core("AW2726DM"), "AW2726DM");
+        assert!(is_local_net("192.168.1.20".parse().unwrap()));
+        assert!(!is_local_net("8.8.8.8".parse().unwrap()));
+    }
+}

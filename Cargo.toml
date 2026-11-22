@@ -1,0 +1,48 @@
+[package]
+name = "switchboard"
+version = "0.1.0"
+edition = "2021"
+description = "Share one mouse across multiple computers on your desk, with monitor input switching."
+license = "MIT"
+default-run = "switchboard"
+
+[dependencies]
+snow = { version = "0.9", default-features = false, features = ["default-resolver"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+log = "0.4"
+getrandom = "0.2"
+blake2 = "0.10"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_Graphics_Gdi",
+    "Win32_Devices_Display",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
+    "Win32_UI_Shell",
+    "Win32_System_Power",
+    "Win32_System_SystemInformation",
+    "Win32_System_ProcessStatus",
+    "Win32_Networking_WinSock",
+    "Win32_System_Console",
+] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+x11rb = { version = "0.13", features = ["xinput", "xtest", "randr", "xfixes"] }
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "abort"
