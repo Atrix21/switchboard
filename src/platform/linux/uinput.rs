@@ -70,6 +70,24 @@ impl UinputInjector {
             io(libc::ioctl(fd, UI_DEV_CREATE))?;
         }
         let x = super::XTestInjector::new()?;
+        // Forwarded motion already carries the source machine's pointer
+        // ballistics, so this device must not be accelerated again.
+        std::thread::spawn(|| {
+            for _ in 0..50 {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                match set_flat_profile() {
+                    Ok(true) => {
+                        log::info!("virtual pointer: flat acceleration profile");
+                        return;
+                    }
+                    Ok(false) => {}
+                    Err(e) => {
+                        log::warn!("could not set flat acceleration on virtual pointer: {e}");
+                        return;
+                    }
+                }
+            }
+        });
         Ok(UinputInjector { f, buf: Vec::with_capacity(24 * 16), x, wheel: (0, 0), dirty: false })
     }
 
@@ -146,6 +164,11 @@ impl Injector for UinputInjector {
     fn cursor_pos(&mut self) -> Option<(i32, i32)> {
         self.x.cursor_pos()
     }
+    fn key(&mut self, code: u16, down: bool) -> io::Result<()> {
+        self.flush()?;
+        self.x.key(code, down)?;
+        self.x.flush()
+    }
     fn flush(&mut self) -> io::Result<()> {
         if self.buf.is_empty() {
             return Ok(());
@@ -157,4 +180,32 @@ impl Injector for UinputInjector {
         self.buf.clear();
         r
     }
+}
+
+/// Sets "libinput Accel Profile Enabled" = flat on our device. Ok(false) if the
+/// device has not appeared in X yet.
+fn set_flat_profile() -> io::Result<bool> {
+    use x11rb::connection::Connection;
+    use x11rb::protocol::xinput::{self, ConnectionExt as _};
+    use x11rb::protocol::xproto::{AtomEnum, ConnectionExt as _};
+    let e = |x: &dyn std::fmt::Display| io::Error::other(x.to_string());
+    let (c, _) = x11rb::connect(None).map_err(|x| e(&x))?;
+    let devs = c.xinput_xi_query_device(xinput::Device::ALL).map_err(|x| e(&x))?.reply().map_err(|x| e(&x))?;
+    let Some(dev) = devs.infos.iter().find(|d| d.name == b"Switchboard Virtual Pointer" && d.type_ == xinput::DeviceType::SLAVE_POINTER) else {
+        return Ok(false);
+    };
+    let prop = c.intern_atom(true, b"libinput Accel Profile Enabled").map_err(|x| e(&x))?.reply().map_err(|x| e(&x))?.atom;
+    if prop == 0 {
+        return Err(e(&"libinput driver not in use"));
+    }
+    let cur = c.xinput_xi_get_property(dev.deviceid, false, prop, u32::from(AtomEnum::ANY), 0, 16).map_err(|x| e(&x))?.reply().map_err(|x| e(&x))?;
+    let n = cur.num_items as usize;
+    if n < 2 {
+        return Ok(false);
+    }
+    let mut v = vec![0u8; n];
+    v[1] = 1; // [adaptive, flat, (custom)]
+    c.xinput_xi_change_property(dev.deviceid, x11rb::protocol::xproto::PropMode::REPLACE, prop, cur.type_, n as u32, &xinput::XIChangePropertyAux::Data8(v)).map_err(|x| e(&x))?;
+    c.flush().map_err(|x| e(&x))?;
+    Ok(true)
 }

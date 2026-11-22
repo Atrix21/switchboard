@@ -172,6 +172,7 @@ pub fn handle(e: &Arc<Engine>, req: Value) -> Value {
                     (Some("m"), _) => CapEvent::Motion { dx: ev[1].as_i64().unwrap_or(0) as i32, dy: ev[2].as_i64().unwrap_or(0) as i32 },
                     (Some("d"), _) => CapEvent::Button { button: Button::from_u8(ev[1].as_u64().unwrap_or(0) as u8).unwrap(), down: true },
                     (Some("u"), _) => CapEvent::Button { button: Button::from_u8(ev[1].as_u64().unwrap_or(0) as u8).unwrap(), down: false },
+                    (Some("k"), _) => CapEvent::Key { code: ev[1].as_u64().unwrap_or(0) as u16, down: ev[2].as_bool().unwrap_or(true) },
                     (Some("w"), _) => CapEvent::Wheel { v: ev[1].as_i64().unwrap_or(0) as i32, h: ev[2].as_i64().unwrap_or(0) as i32 },
                     _ => continue,
                 };
@@ -182,7 +183,7 @@ pub fn handle(e: &Arc<Engine>, req: Value) -> Value {
         "recorded" if std::env::var("SWITCHBOARD_TEST").is_ok() => {
             let r = crate::platform::null::recorded();
             let r = r.lock().unwrap();
-            Ok(json!({"x": r.x, "y": r.y, "buttons": r.buttons, "log": r.log, "wheel_v": r.wheel_v, "wheel_h": r.wheel_h}))
+            Ok(json!({"x": r.x, "y": r.y, "buttons": r.buttons, "log": r.log, "wheel_v": r.wheel_v, "wheel_h": r.wheel_h, "keys": r.keys.iter().collect::<Vec<_>>()}))
         }
         "config" => Ok(serde_json::to_value(&*e.cfg.read().unwrap()).unwrap()),
         "quit" => {

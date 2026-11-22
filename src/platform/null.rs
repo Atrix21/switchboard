@@ -19,6 +19,7 @@ pub struct Recorded {
     pub log: Vec<String>,
     pub wheel_v: i32,
     pub wheel_h: i32,
+    pub keys: crate::keymap::KeySet,
 }
 
 pub fn recorded() -> Arc<Mutex<Recorded>> {
@@ -71,9 +72,17 @@ impl Injector for RecordingInjector {
         let r = r.lock().unwrap();
         Some((r.x, r.y))
     }
+    fn key(&mut self, code: u16, down: bool) -> io::Result<()> {
+        let r = recorded();
+        let mut r = r.lock().unwrap();
+        r.keys.set(code, down);
+        r.log.push(format!("key {code} {}", if down { "down" } else { "up" }));
+        Ok(())
+    }
 }
 
 pub struct NoCapture;
 impl Capture for NoCapture {
     fn set_forwarding(&self, _on: bool, _park: (i32, i32)) {}
+    fn set_keyboard_forwarding(&self, _on: bool) {}
 }

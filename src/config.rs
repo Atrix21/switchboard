@@ -21,6 +21,7 @@ pub struct Config {
     pub monitor: MonitorConfig,
     pub hotkeys: Hotkeys,
     pub clipboard: ClipboardConfig,
+    pub keyboard: KeyboardConfig,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -127,6 +128,20 @@ impl Default for ClipboardConfig {
     }
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct KeyboardConfig {
+    /// Keystrokes go to whichever computer has the pointer, wherever the
+    /// keyboard is physically connected.
+    pub follow_pointer: bool,
+}
+
+impl Default for KeyboardConfig {
+    fn default() -> Self {
+        KeyboardConfig { follow_pointer: true }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Config {
@@ -139,6 +154,7 @@ impl Default for Config {
             monitor: MonitorConfig::default(),
             hotkeys: Hotkeys::default(),
             clipboard: ClipboardConfig::default(),
+            keyboard: KeyboardConfig::default(),
         }
     }
 }

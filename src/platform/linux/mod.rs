@@ -162,6 +162,14 @@ impl Injector for XTestInjector {
         let r = self.c.query_pointer(self.root).ok()?.reply().ok()?;
         Some((r.root_x as i32, r.root_y as i32))
     }
+    fn key(&mut self, code: u16, down: bool) -> io::Result<()> {
+        if code > 247 {
+            return Ok(());
+        }
+        let t = if down { xproto::KEY_PRESS_EVENT } else { xproto::KEY_RELEASE_EVENT };
+        self.c.xtest_fake_input(t, (code + 8) as u8, 0, NONE, 0, 0, 0).map_err(xerr)?;
+        Ok(())
+    }
     fn flush(&mut self) -> io::Result<()> {
         self.c.flush().map_err(xerr)
     }
@@ -182,21 +190,46 @@ pub fn new_injector() -> io::Result<Box<dyn Injector>> {
 // ---------------------------------------------------------------- capture
 
 static FORWARDING: AtomicBool = AtomicBool::new(false);
+static KB_FORWARDING: AtomicBool = AtomicBool::new(false);
 static PARK_X: AtomicI32 = AtomicI32::new(0);
 static PARK_Y: AtomicI32 = AtomicI32::new(0);
 
 struct XCapture {
-    c: Mutex<RustConnection>,
+    c: Arc<RustConnection>,
     root: xproto::Window,
     cursor: xproto::Cursor,
+    lock: Mutex<()>,
 }
 
 impl Capture for XCapture {
+    fn set_keyboard_forwarding(&self, on: bool) {
+        let was = KB_FORWARDING.swap(on, Ordering::SeqCst);
+        if was == on {
+            return;
+        }
+        let _g = self.lock.lock().unwrap();
+        let c = &*self.c;
+        if on {
+            // Retry briefly: a menu or another app may hold a transient grab.
+            for _ in 0..20 {
+                match c.grab_keyboard(false, self.root, x11rb::CURRENT_TIME, GrabMode::ASYNC, GrabMode::ASYNC).map(|r| r.reply()) {
+                    Ok(Ok(r)) if r.status == xproto::GrabStatus::SUCCESS => return,
+                    _ => std::thread::sleep(std::time::Duration::from_millis(25)),
+                }
+            }
+            log::warn!("keyboard grab failed; keys typed here will also reach local apps");
+        } else {
+            let _ = c.ungrab_keyboard(x11rb::CURRENT_TIME);
+            let _ = c.flush();
+        }
+    }
+
     fn set_forwarding(&self, on: bool, park: (i32, i32)) {
         PARK_X.store(park.0, Ordering::Relaxed);
         PARK_Y.store(park.1, Ordering::Relaxed);
         let was = FORWARDING.swap(on, Ordering::SeqCst);
-        let c = self.c.lock().unwrap();
+        let _g = self.lock.lock().unwrap();
+        let c = &*self.c;
         if on {
             let _ = c.warp_pointer(NONE, self.root, 0, 0, 0, 0, park.0 as i16, park.1 as i16);
             if !was {
@@ -216,9 +249,9 @@ impl Capture for XCapture {
 
 impl Drop for XCapture {
     fn drop(&mut self) {
-        let c = self.c.lock().unwrap();
-        let _ = c.ungrab_pointer(x11rb::CURRENT_TIME);
-        let _ = c.flush();
+        let _ = self.c.ungrab_pointer(x11rb::CURRENT_TIME);
+        let _ = self.c.ungrab_keyboard(x11rb::CURRENT_TIME);
+        let _ = self.c.flush();
     }
 }
 
@@ -304,7 +337,12 @@ pub fn start_capture(handler: Arc<dyn CaptureHandler>, opts: CaptureOptions) -> 
             ignore.push(d.deviceid);
         }
     }
-    let mask = xinput::XIEventMask::RAW_MOTION | xinput::XIEventMask::RAW_BUTTON_PRESS | xinput::XIEventMask::RAW_BUTTON_RELEASE | xinput::XIEventMask::HIERARCHY;
+    let mask = xinput::XIEventMask::RAW_MOTION
+        | xinput::XIEventMask::RAW_BUTTON_PRESS
+        | xinput::XIEventMask::RAW_BUTTON_RELEASE
+        | xinput::XIEventMask::RAW_KEY_PRESS
+        | xinput::XIEventMask::RAW_KEY_RELEASE
+        | xinput::XIEventMask::HIERARCHY;
     c.xinput_xi_select_events(root, &[xinput::EventMask { deviceid: xinput::Device::ALL_MASTER.into(), mask: vec![mask] }]).map_err(xerr)?;
     let mut keys: Vec<(u8, u16, u32)> = vec![];
     for h in &opts.hotkeys {
@@ -323,10 +361,10 @@ pub fn start_capture(handler: Arc<dyn CaptureHandler>, opts: CaptureOptions) -> 
     c.change_window_attributes(root, &xproto::ChangeWindowAttributesAux::new().event_mask(EventMask::NO_EVENT)).map_err(xerr)?;
     c.flush().map_err(xerr)?;
 
-    let (c2, _) = connect()?;
-    let cursor = invisible_cursor(&c2, root)?;
-    c2.flush().map_err(xerr)?;
-    let cap = Arc::new(XCapture { c: Mutex::new(c2), root, cursor });
+    let cursor = invisible_cursor(&c, root)?;
+    c.flush().map_err(xerr)?;
+    let c = Arc::new(c);
+    let cap = Arc::new(XCapture { c: c.clone(), root, cursor, lock: Mutex::new(()) });
 
     let (tx, rx) = mpsc::channel::<()>();
     std::thread::Builder::new().name("sb-xi2".into()).spawn(move || {
@@ -408,6 +446,16 @@ pub fn start_capture(handler: Arc<dyn CaptureHandler>, opts: CaptureOptions) -> 
                     if let Ok(Ok(r)) = c.xinput_xi_query_device(xinput::Device::ALL).map(|r| r.reply()) {
                         ignore = r.infos.iter().filter(|d| { let n = String::from_utf8_lossy(&d.name); n.contains("XTEST") || n.contains("Switchboard") }).map(|d| d.deviceid).collect();
                     }
+                }
+                Event::XinputRawKeyPress(e) | Event::XinputRawKeyRelease(e) => {
+                    if !KB_FORWARDING.load(Ordering::Relaxed) || ignore.contains(&e.sourceid) || e.detail < 8 {
+                        continue;
+                    }
+                    let down = e.event_type == 13; // XI_RawKeyPress (14 = release)
+                    handler.on_event(CapEvent::Key { code: (e.detail - 8) as u16, down }, (0, 0));
+                }
+                Event::KeyPress(_) | Event::KeyRelease(_) if KB_FORWARDING.load(Ordering::Relaxed) => {
+                    // Delivered to us by the active keyboard grab; raw events above carry the data.
                 }
                 Event::KeyPress(k) => {
                     let st = u16::from(k.state) & !(2 | 16);

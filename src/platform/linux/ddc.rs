@@ -124,7 +124,6 @@ fn set_vcp(bus: u32, code: u8, value: u16) -> io::Result<()> {
 
 struct Found {
     bus: u32,
-    model: String,
 }
 
 static CACHE: Mutex<Vec<(u32, String, String)>> = Mutex::new(Vec::new());
@@ -144,12 +143,12 @@ fn scan() -> Vec<(u32, String, String)> {
 
 fn find(model: &str) -> io::Result<Found> {
     if let Some(b) = std::env::var("SWITCHBOARD_I2C_BUS").ok().and_then(|b| b.parse().ok()) {
-        return Ok(Found { bus: b, model: model.into() });
+        return Ok(Found { bus: b });
     }
     scan()
         .into_iter()
         .find(|(_, mfg, m)| model.is_empty() || m.contains(model) || model.contains(m.as_str()) && !m.is_empty() || format!("{mfg} {m}").contains(model))
-        .map(|(bus, _, m)| Found { bus, model: m })
+        .map(|(bus, _, _)| Found { bus })
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("no DDC monitor matching {model:?} (no access to /dev/i2c-*?)")))
 }
 

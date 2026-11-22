@@ -131,6 +131,17 @@ impl Injector for SendInputInjector {
         let mut p = POINT { x: 0, y: 0 };
         (unsafe { GetCursorPos(&mut p) } != 0).then_some((p.x, p.y))
     }
+    fn key(&mut self, code: u16, down: bool) -> io::Result<()> {
+        let up = if down { 0 } else { KEYEVENTF_KEYUP };
+        let ki = if code == crate::keymap::KEY_PAUSE {
+            KEYBDINPUT { wVk: VK_PAUSE, wScan: 0, dwFlags: up, time: 0, dwExtraInfo: SB_EXTRA_INFO }
+        } else {
+            let Some((scan, ext)) = crate::keymap::evdev_to_win(code) else { return Ok(()) };
+            KEYBDINPUT { wVk: 0, wScan: scan, dwFlags: KEYEVENTF_SCANCODE | up | if ext { KEYEVENTF_EXTENDEDKEY } else { 0 }, time: 0, dwExtraInfo: SB_EXTRA_INFO }
+        };
+        self.batch.push(INPUT { r#type: INPUT_KEYBOARD, Anonymous: INPUT_0 { ki } });
+        Ok(())
+    }
     fn flush(&mut self) -> io::Result<()> {
         if self.batch.is_empty() {
             return Ok(());
@@ -153,34 +164,103 @@ static PARK_X: AtomicI32 = AtomicI32::new(0);
 static PARK_Y: AtomicI32 = AtomicI32::new(0);
 /// Events swallowed by the hook (diagnostics).
 pub static HOOK_SWALLOWED: AtomicU32 = AtomicU32::new(0);
-/// Raw input events seen while forwarding (diagnostics: proves raw input
-/// keeps flowing while the hook blocks the cursor).
+/// Raw input events seen while forwarding (diagnostics only: Windows 11
+/// throttles background raw input, so the hook is the data source).
 pub static RAW_WHILE_FORWARDING: AtomicU32 = AtomicU32::new(0);
-/// Fail-safe: set if the hook swallowed many events while no raw input
-/// arrived (i.e. we would be eating the mouse without forwarding it).
-pub static FAILSAFE_TRIPPED: AtomicBool = AtomicBool::new(false);
-static SWALLOWED_THIS_SESSION: AtomicU32 = AtomicU32::new(0);
-static RAW_THIS_SESSION: AtomicU32 = AtomicU32::new(0);
-const FAILSAFE_LIMIT: u32 = 150;
+
+static HOOK_HANDLER: std::sync::OnceLock<Arc<dyn CaptureHandler>> = std::sync::OnceLock::new();
 
 const WM_APP_HOOK_ON: u32 = WM_APP + 1;
 const WM_APP_HOOK_OFF: u32 = WM_APP + 2;
+const WM_APP_KB_ON: u32 = WM_APP + 3;
+const WM_APP_KB_OFF: u32 = WM_APP + 4;
 
+static KB_FORWARDING: AtomicBool = AtomicBool::new(false);
+/// VKs that were already down when keyboard forwarding started: their
+/// release must reach the local desktop or the key would stay stuck here.
+static KB_HELD_AT_GRAB: [AtomicBool; 256] = [const { AtomicBool::new(false) }; 256];
+
+unsafe extern "system" fn ll_kbd_proc(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    if code == HC_ACTION as i32 && KB_FORWARDING.load(Ordering::Relaxed) {
+        let k = &*(lp as *const KBDLLHOOKSTRUCT);
+        if k.flags & LLKHF_INJECTED == 0 {
+            let up = k.flags & LLKHF_UP != 0;
+            let vk = (k.vkCode & 0xff) as usize;
+            if KB_HELD_AT_GRAB[vk].load(Ordering::Relaxed) {
+                if up {
+                    KB_HELD_AT_GRAB[vk].store(false, Ordering::Relaxed);
+                }
+                return CallNextHookEx(null_mut(), code, wp, lp);
+            }
+            let ext = k.flags & LLKHF_EXTENDED != 0;
+            let mut scan = k.scanCode as u16;
+            if scan == 0 {
+                scan = MapVirtualKeyW(k.vkCode, MAPVK_VK_TO_VSC) as u16;
+            }
+            if let (Some(evdev), Some(h)) = (crate::keymap::win_to_evdev(scan, ext, k.vkCode == VK_PAUSE as u32), HOOK_HANDLER.get()) {
+                h.on_event(CapEvent::Key { code: evdev, down: !up }, (0, 0));
+            }
+            return 1;
+        }
+    }
+    CallNextHookEx(null_mut(), code, wp, lp)
+}
+
+/// While forwarding, the low-level hook is both the blocker and the data
+/// source. Unlike WM_INPUT for background windows (throttled to ~125 Hz on
+/// Windows 11), LL hooks run for every input event, so the mouse's full
+/// polling rate is preserved. The cursor is parked mid-screen, so for each
+/// event `pt - park` is exactly that event's motion after Windows pointer
+/// ballistics (the user's pointer speed / "enhance pointer precision").
 unsafe extern "system" fn ll_mouse_proc(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     if code == HC_ACTION as i32 && FORWARDING.load(Ordering::Relaxed) {
         let info = &*(lp as *const MSLLHOOKSTRUCT);
         if info.flags & LLMHF_INJECTED == 0 {
             HOOK_SWALLOWED.fetch_add(1, Ordering::Relaxed);
-            let n = SWALLOWED_THIS_SESSION.fetch_add(1, Ordering::Relaxed);
-            if n > FAILSAFE_LIMIT && RAW_THIS_SESSION.load(Ordering::Relaxed) == 0 {
-                FORWARDING.store(false, Ordering::SeqCst);
-                FAILSAFE_TRIPPED.store(true, Ordering::SeqCst);
-            } else {
-                return 1;
+            if let Some(h) = HOOK_HANDLER.get() {
+                let park = (PARK_X.load(Ordering::Relaxed), PARK_Y.load(Ordering::Relaxed));
+                let hi = (info.mouseData >> 16) as u16;
+                let x = |down| if hi == 1 { Some(CapEvent::Button { button: Button::Back, down }) } else if hi == 2 { Some(CapEvent::Button { button: Button::Forward, down }) } else { None };
+                let ev = match wp as u32 {
+                    WM_MOUSEMOVE => {
+                        let (dx, dy) = (info.pt.x - park.0, info.pt.y - park.1);
+                        (dx != 0 || dy != 0).then_some(CapEvent::Motion { dx, dy })
+                    }
+                    WM_LBUTTONDOWN => Some(CapEvent::Button { button: Button::Left, down: true }),
+                    WM_LBUTTONUP => Some(CapEvent::Button { button: Button::Left, down: false }),
+                    WM_RBUTTONDOWN => Some(CapEvent::Button { button: Button::Right, down: true }),
+                    WM_RBUTTONUP => Some(CapEvent::Button { button: Button::Right, down: false }),
+                    WM_MBUTTONDOWN => Some(CapEvent::Button { button: Button::Middle, down: true }),
+                    WM_MBUTTONUP => Some(CapEvent::Button { button: Button::Middle, down: false }),
+                    WM_XBUTTONDOWN => x(true),
+                    WM_XBUTTONUP => x(false),
+                    WM_MOUSEWHEEL => Some(CapEvent::Wheel { v: hi as i16 as i32, h: 0 }),
+                    WM_MOUSEHWHEEL => Some(CapEvent::Wheel { v: 0, h: hi as i16 as i32 }),
+                    _ => None,
+                };
+                if let Some(ev) = ev {
+                    h.on_event(ev, park);
+                }
             }
+            return 1;
         }
     }
     CallNextHookEx(null_mut(), code, wp, lp)
+}
+
+/// Centre of the monitor containing `p` – far from any edge so hook
+/// coordinates are never clamped.
+fn park_point(p: (i32, i32)) -> (i32, i32) {
+    unsafe {
+        let hm = MonitorFromPoint(POINT { x: p.0, y: p.1 }, MONITOR_DEFAULTTONEAREST);
+        let mut mi: MONITORINFO = zeroed();
+        mi.cbSize = size_of::<MONITORINFO>() as u32;
+        if GetMonitorInfoW(hm, &mut mi) == 0 {
+            return p;
+        }
+        let r = mi.rcMonitor;
+        ((r.left + r.right) / 2, (r.top + r.bottom) / 2)
+    }
 }
 
 struct WinCapture {
@@ -191,13 +271,22 @@ unsafe impl Send for WinCapture {}
 unsafe impl Sync for WinCapture {}
 
 impl Capture for WinCapture {
+    fn set_keyboard_forwarding(&self, on: bool) {
+        if on {
+            for vk in 0..256usize {
+                let down = unsafe { GetAsyncKeyState(vk as i32) } as u16 & 0x8000 != 0;
+                KB_HELD_AT_GRAB[vk].store(down && !(1..=6).contains(&vk), Ordering::Relaxed);
+            }
+        }
+        let was = KB_FORWARDING.swap(on, Ordering::SeqCst);
+        if was != on {
+            unsafe { PostThreadMessageW(self.hook_thread, if on { WM_APP_KB_ON } else { WM_APP_KB_OFF }, 0, 0) };
+        }
+    }
     fn set_forwarding(&self, on: bool, park: (i32, i32)) {
+        let park = if on { park_point(park) } else { park };
         PARK_X.store(park.0, Ordering::Relaxed);
         PARK_Y.store(park.1, Ordering::Relaxed);
-        if on {
-            SWALLOWED_THIS_SESSION.store(0, Ordering::Relaxed);
-            RAW_THIS_SESSION.store(0, Ordering::Relaxed);
-        }
         let was = FORWARDING.swap(on, Ordering::SeqCst);
         if on {
             unsafe { SetCursorPos(park.0, park.1) };
@@ -211,7 +300,11 @@ impl Capture for WinCapture {
 impl Drop for WinCapture {
     fn drop(&mut self) {
         FORWARDING.store(false, Ordering::SeqCst);
-        unsafe { PostThreadMessageW(self.hook_thread, WM_APP_HOOK_OFF, 0, 0) };
+        KB_FORWARDING.store(false, Ordering::SeqCst);
+        unsafe {
+            PostThreadMessageW(self.hook_thread, WM_APP_HOOK_OFF, 0, 0);
+            PostThreadMessageW(self.hook_thread, WM_APP_KB_OFF, 0, 0);
+        }
     }
 }
 
@@ -223,8 +316,19 @@ fn hook_thread(ready: mpsc::Sender<u32>) {
         PeekMessageW(&mut msg, null_mut(), WM_USER, WM_USER, PM_NOREMOVE);
         let _ = ready.send(GetCurrentThreadId());
         let mut hook: HHOOK = null_mut();
+        let mut kb_hook: HHOOK = null_mut();
         while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
             match msg.message {
+                WM_APP_KB_ON if kb_hook.is_null() => {
+                    kb_hook = SetWindowsHookExW(WH_KEYBOARD_LL, Some(ll_kbd_proc), GetModuleHandleW(null()), 0);
+                    if kb_hook.is_null() {
+                        log::error!("keyboard hook failed: {}", io::Error::last_os_error());
+                    }
+                }
+                WM_APP_KB_OFF if !kb_hook.is_null() => {
+                    UnhookWindowsHookEx(kb_hook);
+                    kb_hook = null_mut();
+                }
                 WM_APP_HOOK_ON if hook.is_null() => {
                     hook = SetWindowsHookExW(WH_MOUSE_LL, Some(ll_mouse_proc), GetModuleHandleW(null()), 0);
                     if hook.is_null() {
@@ -240,6 +344,9 @@ fn hook_thread(ready: mpsc::Sender<u32>) {
         }
         if !hook.is_null() {
             UnhookWindowsHookEx(hook);
+        }
+        if !kb_hook.is_null() {
+            UnhookWindowsHookEx(kb_hook);
         }
     }
 }
@@ -320,7 +427,7 @@ unsafe fn handle_raw(ctx: &mut RawCtx, h: HRAWINPUT) {
     let m = ri.data.mouse;
     if FORWARDING.load(Ordering::Relaxed) {
         RAW_WHILE_FORWARDING.fetch_add(1, Ordering::Relaxed);
-        RAW_THIS_SESSION.fetch_add(1, Ordering::Relaxed);
+        return; // the LL hook delivers forwarded input
     }
     let pos = cursor();
     let (mut dx, mut dy) = (m.lLastX, m.lLastY);
@@ -493,5 +600,5 @@ pub fn process_stats() -> (f64, u64) {
 }
 
 pub fn take_failsafe() -> bool {
-    FAILSAFE_TRIPPED.swap(false, Ordering::SeqCst)
+    false
 }

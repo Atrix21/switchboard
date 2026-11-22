@@ -8,6 +8,7 @@ mod discovery;
 mod engine;
 mod geom;
 mod ipc;
+mod keymap;
 mod logger;
 mod net;
 mod platform;

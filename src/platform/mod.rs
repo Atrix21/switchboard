@@ -31,6 +31,8 @@ pub enum CapEvent {
     /// 1/120-notch units. Positive v = away from user, positive h = right.
     Wheel { v: i32, h: i32 },
     Hotkey { id: u32 },
+    /// Physical key (evdev code) – only reported while keyboard forwarding is on.
+    Key { code: u16, down: bool },
 }
 
 /// Receives physical input on the capture thread. Must be fast: it runs on
@@ -49,6 +51,8 @@ pub trait Injector: Send {
     /// Move the cursor to absolute global coordinates.
     fn warp(&mut self, x: i32, y: i32) -> io::Result<()>;
     fn cursor_pos(&mut self) -> Option<(i32, i32)>;
+    /// Press/release a physical key (evdev code).
+    fn key(&mut self, code: u16, down: bool) -> io::Result<()>;
     /// Flush any batched input to the OS.
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
@@ -101,6 +105,9 @@ pub trait Capture: Send + Sync {
     /// Enter/leave forwarding mode. While forwarding, physical pointer input
     /// must not affect the local desktop. `park` = where to hold the cursor.
     fn set_forwarding(&self, on: bool, park: (i32, i32));
+    /// Divert the physical keyboard to the engine (as `CapEvent::Key`) instead
+    /// of the local desktop.
+    fn set_keyboard_forwarding(&self, on: bool);
 }
 
 /// Shared helper: injector selection by env var for tests/benchmarks.

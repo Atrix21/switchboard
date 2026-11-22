@@ -79,6 +79,8 @@ pub struct InputState {
 
 const KIND_INPUT: u8 = 1;
 const KIND_ACK: u8 = 2;
+const KIND_KEYS: u8 = 3;
+const KIND_KEYACK: u8 = 4;
 
 impl InputState {
     pub fn encode(&self, out: &mut Vec<u8>) {
@@ -161,6 +163,81 @@ impl InputAck {
             return None;
         }
         Some(InputAck { epoch: r.u32()?, seq: r.u64()?, echo_t_us: r.u64()?, hold_us: r.u32()?, inject_us: r.u32()?, received: r.u32()? })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct KeyEvent {
+    pub seq: u32,
+    pub code: u16,
+    pub down: bool,
+}
+
+/// Keyboard snapshot (keyboard source -> pointer owner). Same loss-proof
+/// design as [`InputState`]: recent transitions + authoritative held-key set.
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct KeyState {
+    pub epoch: u32,
+    pub pressed: [u8; 32],
+    pub events: Vec<KeyEvent>,
+}
+
+pub const KEY_RING: usize = 32;
+
+impl KeyState {
+    pub fn encode(&self, out: &mut Vec<u8>) {
+        out.clear();
+        out.push(KIND_KEYS);
+        out.extend_from_slice(&self.epoch.to_le_bytes());
+        out.extend_from_slice(&self.pressed);
+        let n = self.events.len().min(KEY_RING);
+        out.push(n as u8);
+        for e in &self.events[self.events.len() - n..] {
+            out.extend_from_slice(&e.seq.to_le_bytes());
+            out.extend_from_slice(&(e.code | if e.down { 0x8000 } else { 0 }).to_le_bytes());
+        }
+    }
+    pub fn decode(b: &[u8]) -> Option<KeyState> {
+        let mut r = Reader { b, p: 0 };
+        if r.u8()? != KIND_KEYS {
+            return None;
+        }
+        let epoch = r.u32()?;
+        let pressed = r.take::<32>()?;
+        let n = r.u8()? as usize;
+        if n > KEY_RING {
+            return None;
+        }
+        let mut events = Vec::with_capacity(n);
+        for _ in 0..n {
+            let seq = r.u32()?;
+            let c = r.u16()?;
+            events.push(KeyEvent { seq, code: c & 0x7fff, down: c & 0x8000 != 0 });
+        }
+        Some(KeyState { epoch, pressed, events })
+    }
+}
+
+/// Key receiver -> key source: highest transition applied.
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
+pub struct KeyAck {
+    pub epoch: u32,
+    pub seq: u32,
+}
+
+impl KeyAck {
+    pub fn encode(&self, out: &mut Vec<u8>) {
+        out.clear();
+        out.push(KIND_KEYACK);
+        out.extend_from_slice(&self.epoch.to_le_bytes());
+        out.extend_from_slice(&self.seq.to_le_bytes());
+    }
+    pub fn decode(b: &[u8]) -> Option<KeyAck> {
+        let mut r = Reader { b, p: 0 };
+        if r.u8()? != KIND_KEYACK {
+            return None;
+        }
+        Some(KeyAck { epoch: r.u32()?, seq: r.u32()? })
     }
 }
 
@@ -291,6 +368,9 @@ pub enum Ctrl {
     /// Either direction: ask the peer to take/return control
     /// (e.g. hotkey pressed on the machine the keyboard is connected to).
     RequestFocus { target: Focus },
+    /// The pointer is now on `owner` (sender = Me, receiver = You). Keyboards
+    /// forward keystrokes to the focus owner.
+    Focus { owner: Focus },
     /// Ask the peer to switch the shared monitor (fallback when local DDC fails).
     MonitorSet { input: u16, req: u32 },
     MonitorResult { req: u32, ok: bool, detail: String },
@@ -378,6 +458,22 @@ mod tests {
         s.encode(&mut b);
         assert_eq!(InputState::decode(&b).unwrap(), s);
         assert!(InputState::decode(&b[..b.len() - 1]).is_none());
+    }
+
+    #[test]
+    fn keys_roundtrip() {
+        let mut k = KeyState { epoch: 9, ..Default::default() };
+        k.pressed[3] = 0x81;
+        k.events = (1..40).map(|i| KeyEvent { seq: i, code: (i * 7) as u16, down: i % 2 == 0 }).collect();
+        let mut b = Vec::new();
+        k.encode(&mut b);
+        let d = KeyState::decode(&b).unwrap();
+        assert_eq!(d.events.len(), KEY_RING);
+        assert_eq!(d.events.last(), k.events.last());
+        assert_eq!(d.pressed, k.pressed);
+        let a = KeyAck { epoch: 1, seq: 2 };
+        a.encode(&mut b);
+        assert_eq!(KeyAck::decode(&b), Some(a));
     }
 
     #[test]

@@ -98,12 +98,28 @@ try:
     check((r["wheel_v"], r["wheel_h"]) == (-120, 120), f"wheel v/h = {(r['wheel_v'], r['wheel_h'])}")
     check(r["buttons"] == 0, "no buttons left pressed")
 
+    # Keyboard follows the pointer: type "hi" (KEY_H=35, KEY_I=23) with shift held on 'h'.
+    ipc(A, {"cmd": "synth", "events": [["k", 42, True], ["k", 35, True], ["k", 35, False], ["k", 42, False], ["k", 23, True], ["k", 23, False]]})
+    wait(lambda: ipc(B, {"cmd": "recorded"})["log"][-1:] == ["key 23 up"], "keys applied", 5)
+    keys = [l for l in ipc(B, {"cmd": "recorded"})["log"] if l.startswith("key")]
+    check(keys == ["key 42 down", "key 35 down", "key 35 up", "key 42 up", "key 23 down", "key 23 up"], f"keystrokes in order: {keys}")
+    check(ipc(A, {"cmd": "status"})["keyboard_to"] == "beta", "A keyboard forwarding to beta")
+    # Hold a key, then return the pointer: B must release it.
+    ipc(A, {"cmd": "synth", "events": [["k", 30, True]]})
+    wait(lambda: 30 in ipc(B, {"cmd": "recorded"})["keys"], "A key held on B")
+
     # Return via B's left edge.
     ipc(A, {"cmd": "synth", "events": [["m", -50, 0]] * 3})
     wait(lambda: ipc(A, {"cmd": "status"})["mode"] == "local", "A local again")
     check(ipc(B, {"cmd": "status"})["mode"] == "local", "B local after leave")
+    wait(lambda: ipc(B, {"cmd": "recorded"})["keys"] == [], "held key released on B after pointer left", 3)
+    check(True, "held key released on B when pointer returned")
+    check(ipc(A, {"cmd": "status"})["keyboard_to"] is None, "A keyboard local again")
 
     # Stuck-button recovery: press on B then kill A.
+    ipc(A, {"cmd": "synth", "x": 1919, "y": 300, "events": [["m", 4, 0]]})
+    check(ipc(A, {"cmd": "status"})["mode"] == "local", "edge disarmed right after return (no bounce)")
+    ipc(A, {"cmd": "synth", "x": 1800, "y": 300, "events": [["m", -1, 0]]})  # move off the edge: re-arms
     ipc(A, {"cmd": "synth", "x": 1919, "y": 300, "events": [["m", 4, 0]]})
     wait(lambda: ipc(B, {"cmd": "status"})["mode"].startswith("controlled"), "B hosted again")
     ipc(A, {"cmd": "synth", "events": [["d", 2]]})

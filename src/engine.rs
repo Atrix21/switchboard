@@ -24,6 +24,7 @@ use serde_json::{json, Value};
 use crate::config::{Config, Link, PeerConfig};
 use crate::ddc::Coordinator;
 use crate::geom::{self, Push};
+use crate::keymap::KeySet;
 use crate::net::{self, Identity, Session};
 use crate::platform::{self, CapEvent, Capture, CaptureHandler, CaptureOptions, Hotkey, Injector};
 use crate::proto::*;
@@ -128,8 +129,39 @@ struct SinkState {
     inject: Histogram,
 }
 
+/// Keyboard forwarding: this machine's keyboard -> focus owner.
+#[derive(Default)]
+struct KbSource {
+    target: Option<Arc<Peer>>,
+    st: KeyState,
+    keys: KeySet,
+    seq: u32,
+    acked: u32,
+    last_send: Option<Instant>,
+    /// Keys consumed by a local hotkey (their release is swallowed too).
+    swallowed: KeySet,
+    enc: Vec<u8>,
+    dgram: Vec<u8>,
+}
+
+/// Keys received from a peer's keyboard.
+#[derive(Default)]
+struct KbSink {
+    from: Option<Arc<Peer>>,
+    epoch: u32,
+    seq: u32,
+    pressed: KeySet,
+    last_rx: Option<Instant>,
+}
+
 struct State {
     mode: Mode,
+    /// Who has the pointer (None = this machine). Keystrokes follow it.
+    focus: Option<Arc<Peer>>,
+    focus_announced: bool,
+    kb: KbSource,
+    ksink: KbSink,
+    hotkeys: Vec<(u32, Hotkey, u16)>,
     next_epoch: u32,
     disabled: bool,
     // ---- source
@@ -246,6 +278,11 @@ impl Engine {
             peers: RwLock::new(vec![]),
             st: Mutex::new(State {
                 mode: Mode::Local,
+                focus: None,
+                focus_announced: false,
+                kb: KbSource::default(),
+                ksink: KbSink::default(),
+                hotkeys: vec![],
                 next_epoch: net::random_u32() & 0xffff,
                 disabled: false,
                 src: InputState::default(),
@@ -292,10 +329,11 @@ impl Engine {
         }
 
         // Capture
-        let hk = {
+        let hk: Vec<Hotkey> = {
             let c = e.cfg.read().unwrap();
             [Hotkey::parse(HOTKEY_EMERGENCY, &c.hotkeys.emergency), Hotkey::parse(HOTKEY_TOGGLE, &c.hotkeys.toggle)].into_iter().flatten().collect()
         };
+        e.st.lock().unwrap().hotkeys = hk.iter().filter_map(|h| crate::keymap::name_to_evdev(&h.key).map(|c| (h.id, h.clone(), c))).collect();
         match platform::start_capture(Arc::new(Handler(e.clone())), CaptureOptions { hotkeys: hk }) {
             Ok(c) => {
                 let _ = e.capture.set(c);
@@ -487,6 +525,19 @@ impl Engine {
         }
         let mut st = self.st.lock().unwrap();
         let st = &mut *st;
+        if let CapEvent::Key { code, down } = ev {
+            self.on_key(st, code, down);
+            return;
+        }
+        if matches!(st.mode, Mode::Local) && matches!(ev, CapEvent::Motion { .. }) && (st.focus.is_some() || !st.focus_announced) {
+            // The user is using this machine's own pointer: claim focus so a
+            // keyboard connected elsewhere types here.
+            self.set_focus(st, None);
+            st.focus_announced = true;
+            for p in self.trusted_peers() {
+                std::thread::spawn(move || p.send(Ctrl::Focus { owner: Focus::Me }));
+            }
+        }
         match ev {
             CapEvent::Button { button, down } => {
                 if down {
@@ -531,7 +582,7 @@ impl Engine {
                         st.src.cum_wheel_v = st.src.cum_wheel_v.wrapping_add(v);
                         st.src.cum_wheel_h = st.src.cum_wheel_h.wrapping_add(h);
                     }
-                    CapEvent::Hotkey { .. } => {}
+                    CapEvent::Hotkey { .. } | CapEvent::Key { .. } => {}
                 }
                 self.send_input(st, &peer);
                 // Emergency chord: left+right+middle held.
@@ -605,6 +656,7 @@ impl Engine {
             s.last_switch_reason = reason.into();
         }
         let _ = self.tx.send(Ev::SendEnter(peer.clone(), epoch, edge, pos, to));
+        self.set_focus(st, Some(peer.clone()));
         self.switch_monitor_to(Some(&peer));
         self.send_input(st, &peer);
     }
@@ -635,6 +687,7 @@ impl Engine {
             let p = peer.clone();
             std::thread::spawn(move || p.send(Ctrl::Revoke { epoch }));
         }
+        self.set_focus(st, None);
         log::info!("← local ({reason})");
         {
             let mut s = self.stats.lock().unwrap();
@@ -655,18 +708,22 @@ impl Engine {
         st.src.t_us = now_us();
         st.src.encode(&mut st.enc);
         if peer.sess.seal_udp(send_id, &st.enc, &mut st.dgram).is_ok() {
-            if let Some(p) = std::env::var("SWITCHBOARD_TEST_DROP").ok().and_then(|v| v.parse::<u64>().ok()) {
-                // Test hook: deterministically drop every p-th datagram.
-                if p > 0 && self.seq_drop.fetch_add(1, Ordering::Relaxed) % p == 0 {
-                    st.last_send = Instant::now();
-                    return;
-                }
+            if self.test_drop() {
+                st.last_send = Instant::now();
+                return;
             }
             let _ = self.udp.send_to(&st.dgram, addr);
             st.sent += 1;
             st.last_send = Instant::now();
             self.stats.lock().unwrap().send_rate.tick();
         }
+    }
+
+    /// Test hook (SWITCHBOARD_TEST_DROP=n): deterministically drop every n-th datagram.
+    fn test_drop(&self) -> bool {
+        static N: OnceLock<u64> = OnceLock::new();
+        let n = *N.get_or_init(|| std::env::var("SWITCHBOARD_TEST_DROP").ok().and_then(|v| v.parse().ok()).unwrap_or(0));
+        n > 0 && self.seq_drop.fetch_add(1, Ordering::Relaxed) % n == 0
     }
 
     fn switch_monitor_to(&self, peer: Option<&Peer>) {
@@ -691,6 +748,162 @@ impl Engine {
         };
         if let Some(t) = target {
             self.monitor.request(t);
+        }
+    }
+
+    // ------------------------------------------------------------ keyboard
+
+    /// Change who has the pointer; keyboard forwarding follows.
+    fn set_focus(&self, st: &mut State, new: Option<Arc<Peer>>) {
+        let same = match (&st.focus, &new) {
+            (None, None) => true,
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        };
+        if same {
+            return;
+        }
+        st.focus = new.clone();
+        let follow = self.cfg.read().unwrap().keyboard.follow_pointer;
+        // Release everything at the old target.
+        if st.kb.target.is_some() {
+            st.kb.keys = KeySet::default();
+            st.kb.st.events.clear();
+            self.send_keys(st);
+            st.kb.target = None;
+        }
+        match new {
+            Some(p) if follow && p.trusted.load(Ordering::Relaxed) => {
+                st.kb.target = Some(p.clone());
+                st.kb.st = KeyState { epoch: st.next_epoch, ..Default::default() };
+                st.next_epoch = st.next_epoch.wrapping_add(1);
+                st.kb.keys = KeySet::default();
+                st.kb.swallowed = KeySet::default();
+                st.kb.seq = 0;
+                st.kb.acked = 0;
+                if let Some(c) = self.capture.get() {
+                    c.set_keyboard_forwarding(true);
+                }
+                log::info!("keyboard -> {}", p.name());
+            }
+            _ => {
+                if let Some(c) = self.capture.get() {
+                    c.set_keyboard_forwarding(false);
+                }
+            }
+        }
+    }
+
+    fn on_key(&self, st: &mut State, code: u16, down: bool) {
+        if st.kb.target.is_none() {
+            return;
+        }
+        // Local hotkeys still work while the keyboard is diverted.
+        if down {
+            let m = st.kb.keys;
+            let hit = st.hotkeys.iter().find(|(_, h, c)| *c == code && h.ctrl == m.ctrl() && h.alt == m.alt() && h.shift == m.shift() && h.meta == m.meta()).map(|(id, _, _)| *id);
+            if let Some(id) = hit {
+                st.kb.swallowed.set(code, true);
+                let _ = self.tx.send(Ev::Hotkey(id));
+                return;
+            }
+        } else if st.kb.swallowed.get(code) {
+            st.kb.swallowed.set(code, false);
+            return;
+        }
+        if down && st.kb.keys.get(code) {
+            // Autorepeat from the source OS: the target generates its own repeats.
+            return;
+        }
+        st.kb.keys.set(code, down);
+        st.kb.seq += 1;
+        let seq = st.kb.seq;
+        if st.kb.st.events.len() == KEY_RING {
+            st.kb.st.events.remove(0);
+        }
+        st.kb.st.events.push(KeyEvent { seq, code, down });
+        self.send_keys(st);
+    }
+
+    fn send_keys(&self, st: &mut State) {
+        let Some(peer) = st.kb.target.clone() else { return };
+        let (addr, send_id) = {
+            let i = peer.info.lock().unwrap();
+            match i.udp_addr {
+                Some(a) => (a, i.send_id),
+                None => return,
+            }
+        };
+        st.kb.st.pressed = st.kb.keys.0;
+        let kb = &mut st.kb;
+        kb.st.encode(&mut kb.enc);
+        if peer.sess.seal_udp(send_id, &kb.enc, &mut kb.dgram).is_ok() {
+            kb.last_send = Some(Instant::now());
+            if !self.test_drop() {
+                let _ = self.udp.send_to(&kb.dgram, addr);
+            }
+        }
+    }
+
+    fn on_keys(&self, peer: &Arc<Peer>, k: KeyState) {
+        let mut st = self.st.lock().unwrap();
+        let st = &mut *st;
+        let same_src = st.ksink.from.as_ref().is_some_and(|f| Arc::ptr_eq(f, peer));
+        if !same_src || st.ksink.epoch != k.epoch {
+            if !same_src {
+                self.release_keys(st);
+            }
+            st.ksink.from = Some(peer.clone());
+            st.ksink.epoch = k.epoch;
+            st.ksink.seq = 0;
+        }
+        st.ksink.last_rx = Some(Instant::now());
+        {
+            let mut inj = self.inj.lock().unwrap();
+            let ks = &mut st.ksink;
+            let seen = ks.seq;
+            for e in k.events.iter().filter(|e| e.seq > seen) {
+                if ks.pressed.get(e.code) != e.down {
+                    let _ = inj.key(e.code, e.down);
+                    ks.pressed.set(e.code, e.down);
+                }
+                ks.seq = e.seq;
+            }
+            let want = KeySet(k.pressed);
+            if ks.pressed != want {
+                for c in 0..256u16 {
+                    if ks.pressed.get(c) != want.get(c) {
+                        let _ = inj.key(c, want.get(c));
+                    }
+                }
+                ks.pressed = want;
+            }
+            let _ = inj.flush();
+        }
+        let a = KeyAck { epoch: k.epoch, seq: st.ksink.seq };
+        let (addr, send_id) = {
+            let i = peer.info.lock().unwrap();
+            match i.udp_addr {
+                Some(x) => (x, i.send_id),
+                None => return,
+            }
+        };
+        let mut p = Vec::with_capacity(16);
+        a.encode(&mut p);
+        let mut d = Vec::with_capacity(48);
+        if peer.sess.seal_udp(send_id, &p, &mut d).is_ok() {
+            let _ = self.udp.send_to(&d, addr);
+        }
+    }
+
+    fn release_keys(&self, st: &mut State) {
+        let pressed = std::mem::take(&mut st.ksink.pressed);
+        if !pressed.is_empty() {
+            let mut inj = self.inj.lock().unwrap();
+            for c in pressed.iter() {
+                let _ = inj.key(c, false);
+            }
+            let _ = inj.flush();
         }
     }
 
@@ -737,10 +950,31 @@ impl Engine {
                 }
             }
         }
-        if let Some(s) = InputState::decode(plain) {
-            self.on_input(&peer, s, seq, rx_at);
-        } else if let Some(a) = InputAck::decode(plain) {
-            self.on_ack(&peer, a);
+        match plain.first() {
+            Some(1) => {
+                if let Some(s) = InputState::decode(plain) {
+                    self.on_input(&peer, s, seq, rx_at);
+                }
+            }
+            Some(2) => {
+                if let Some(a) = InputAck::decode(plain) {
+                    self.on_ack(&peer, a);
+                }
+            }
+            Some(3) => {
+                if let Some(k) = KeyState::decode(plain) {
+                    self.on_keys(&peer, k);
+                }
+            }
+            Some(4) => {
+                if let Some(a) = KeyAck::decode(plain) {
+                    let mut st = self.st.lock().unwrap();
+                    if st.kb.target.as_ref().is_some_and(|t| Arc::ptr_eq(t, &peer)) && a.epoch == st.kb.st.epoch {
+                        st.kb.acked = st.kb.acked.max(a.seq);
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
@@ -856,6 +1090,7 @@ impl Engine {
         let left = leave.is_some();
         if let Some((edge, pos, to)) = leave {
             st.mode = Mode::Local;
+            self.set_focus(st, Some(peer.clone()));
             let _ = self.tx.send(Ev::SendLeave(peer.clone(), epoch, edge, pos, to));
         }
         // 5. Ack (throttled).
@@ -949,6 +1184,17 @@ impl Engine {
         let timeout = Duration::from_millis(self.cfg.read().unwrap().switching.peer_timeout_ms);
         let mut st = self.st.lock().unwrap();
         let st = &mut *st;
+        // Keyboard: resend until acknowledged; keepalive while keys are held.
+        if st.kb.target.is_some() {
+            let since = st.kb.last_send.map(|t| t.elapsed()).unwrap_or(Duration::MAX);
+            if (st.kb.acked < st.kb.seq && since >= Duration::from_millis(20)) || (!st.kb.keys.is_empty() && since >= Duration::from_millis(250)) {
+                self.send_keys(st);
+            }
+        }
+        if !st.ksink.pressed.is_empty() && st.ksink.last_rx.is_some_and(|t| t.elapsed() > SINK_IDLE_RELEASE) {
+            log::info!("keyboard source went quiet; releasing held keys");
+            self.release_keys(st);
+        }
         match st.mode.clone() {
             Mode::Remote { peer, .. } => {
                 if platform::os::take_failsafe() {
@@ -1014,6 +1260,15 @@ impl Engine {
             Ev::Connected => {}
             Ev::Closed(p) => {
                 self.peers.write().unwrap().retain(|q| !Arc::ptr_eq(q, &p));
+                {
+                    let mut st = self.st.lock().unwrap();
+                    if st.focus.as_ref().is_some_and(|f| Arc::ptr_eq(f, &p)) {
+                        self.set_focus(&mut st, None);
+                    }
+                    if st.ksink.from.as_ref().is_some_and(|f| Arc::ptr_eq(f, &p)) {
+                        self.release_keys(&mut st);
+                    }
+                }
                 self.tick();
             }
             Ev::SendEnter(p, epoch, edge, pos, to) => p.send(Ctrl::Enter { epoch, edge, pos, to_screen: to.screen, to_edge: to.edge }),
@@ -1178,6 +1433,7 @@ impl Engine {
                 let push = returns.iter().map(|_| { let mut p = Push::default(); p.disarm(); p }).collect();
                 st.sink = SinkState { returns, push, ..Default::default() };
                 st.mode = Mode::Hosted { peer: p.clone(), epoch };
+                self.set_focus(st, None);
                 let (x, y) = geom::entry_point(&land_seg, land_edge, pos);
                 let _ = self.inj.lock().unwrap().warp(x, y);
                 let ret_edge = land_edge;
@@ -1198,6 +1454,7 @@ impl Engine {
                     if Arc::ptr_eq(peer, p) && *e == epoch {
                         self.release_all_injected(&mut st);
                         st.mode = Mode::Local;
+                        self.set_focus(&mut st, Some(p.clone()));
                         log::info!("{} took the pointer back", p.name());
                     }
                 }
@@ -1216,6 +1473,15 @@ impl Engine {
                         self.begin_remote(st, p.clone(), edge, seg, 0.5, park, Target::default(), "peer hotkey");
                     }
                     _ => {}
+                }
+            }
+            Ctrl::Focus { owner } => {
+                let mut st = self.st.lock().unwrap();
+                if matches!(st.mode, Mode::Local) {
+                    match owner {
+                        Focus::Me => self.set_focus(&mut st, Some(p.clone())),
+                        Focus::You => self.set_focus(&mut st, None),
+                    }
                 }
             }
             Ctrl::MonitorSet { input, req } => {
@@ -1321,6 +1587,8 @@ impl Engine {
             "version": env!("CARGO_PKG_VERSION"),
             "os": std::env::consts::OS,
             "mode": st.mode.label(),
+            "focus": st.focus.as_ref().map(|p| p.name()),
+            "keyboard_to": st.kb.target.as_ref().map(|p| p.name()),
             "disabled": st.disabled,
             "uptime_s": self.started.elapsed().as_secs(),
             "screens": *self.screens.read().unwrap(),
@@ -1396,6 +1664,8 @@ impl Engine {
     pub fn shutdown(&self) {
         self.shutting_down.store(true, Ordering::Relaxed);
         let mut st = self.st.lock().unwrap();
+        self.set_focus(&mut st, None);
+        self.release_keys(&mut st);
         match st.mode.clone() {
             Mode::Remote { .. } => self.end_remote(&mut st, "shutdown", None),
             Mode::Hosted { .. } => {
