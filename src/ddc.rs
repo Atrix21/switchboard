@@ -66,14 +66,21 @@ pub struct MonitorStatus {
     pub last_error: Option<String>,
     pub switches: u64,
     pub failures: u64,
+    /// Last input observed by polling (VCP 0x60).
+    pub observed: Option<u16>,
+    pub manual_switches: u64,
 }
 
 type RemoteFn = Box<dyn Fn(u16) -> bool + Send>;
+type ManualFn = Box<dyn Fn(u16) + Send>;
 
 struct Inner {
     desired: Option<u16>,
     status: MonitorStatus,
     remote: Option<RemoteFn>,
+    /// Called when the input changed without us (e.g. the monitor's own buttons).
+    on_manual: Option<ManualFn>,
+    last_switch: Option<Instant>,
 }
 
 /// Background monitor-switching worker.
@@ -85,7 +92,7 @@ pub struct Coordinator {
 impl Coordinator {
     pub fn new(model: String, local_input: Option<u16>) -> Coordinator {
         let c = Coordinator {
-            inner: Arc::new((Mutex::new(Inner { desired: None, status: MonitorStatus { model, local_input, ..Default::default() }, remote: None }), Condvar::new())),
+            inner: Arc::new((Mutex::new(Inner { desired: None, status: MonitorStatus { model, local_input, ..Default::default() }, remote: None, on_manual: None, last_switch: None }), Condvar::new())),
         };
         let c2 = c.clone();
         std::thread::Builder::new().name("sb-monitor".into()).spawn(move || c2.run()).expect("spawn monitor thread");
@@ -95,6 +102,10 @@ impl Coordinator {
     /// Fallback used when local DDC fails: ask a peer to switch.
     pub fn set_remote_fallback(&self, f: Option<RemoteFn>) {
         self.inner.0.lock().unwrap().remote = f;
+    }
+
+    pub fn set_on_manual(&self, f: Option<ManualFn>) {
+        self.inner.0.lock().unwrap().on_manual = f;
     }
 
     pub fn request(&self, input: u16) {
@@ -107,18 +118,47 @@ impl Coordinator {
         self.inner.0.lock().unwrap().status.clone()
     }
 
+    /// Poll the active input; report changes we did not make.
+    fn watch(&self, model: &str) {
+        let Ok(v) = get_input(model) else { return };
+        let (m, _) = &*self.inner;
+        let mut g = m.lock().unwrap();
+        let prev = g.status.observed.replace(v);
+        if prev.is_some() && prev != Some(v) && g.desired.is_none() {
+            g.status.manual_switches += 1;
+            log::info!("monitor input changed to {} outside Switchboard", crate::config::input_name(v));
+            if let Some(f) = &g.on_manual {
+                f(v);
+            }
+        }
+    }
+
     fn run(&self) {
         let (m, cv) = &*self.inner;
         loop {
             let (target, model) = {
                 let mut g = m.lock().unwrap();
-                while g.desired.is_none() {
-                    g = cv.wait(g).unwrap();
+                if g.desired.is_none() {
+                    g = cv.wait_timeout(g, Duration::from_millis(1500)).unwrap().0;
                 }
-                (g.desired.take().unwrap(), g.status.model.clone())
+                match g.desired.take() {
+                    Some(t) => (t, g.status.model.clone()),
+                    None => {
+                        let model = g.status.model.clone();
+                        let quiet = g.last_switch.is_none_or(|t| t.elapsed() > Duration::from_secs(5));
+                        drop(g);
+                        if !model.is_empty() && quiet {
+                            self.watch(&model);
+                        }
+                        continue;
+                    }
+                }
             };
             if model.is_empty() {
                 continue;
+            }
+            if m.lock().unwrap().status.observed == Some(target) {
+                continue; // already showing it
             }
             let t0 = Instant::now();
             let mut res = set_input(&model, target).map_err(|e| e.to_string());
@@ -136,6 +176,10 @@ impl Coordinator {
             }
             let ms = t0.elapsed().as_millis() as u64;
             let mut g = m.lock().unwrap();
+            g.last_switch = Some(Instant::now());
+            if res.is_ok() {
+                g.status.observed = Some(target);
+            }
             g.status.last_target = Some(target);
             g.status.last_ms = Some(ms);
             g.status.last_ok = Some(res.is_ok());

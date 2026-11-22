@@ -92,11 +92,14 @@ pub struct MonitorConfig {
     pub i2c_bus: Option<u32>,
     /// "auto" | "native" | "ddcutil"
     pub backend: String,
+    /// When the monitor is switched with its own buttons, move the pointer
+    /// (and keyboard) to the computer now on screen.
+    pub follow_manual_switch: bool,
 }
 
 impl Default for MonitorConfig {
     fn default() -> Self {
-        MonitorConfig { enabled: true, model: String::new(), local_input: None, i2c_bus: None, backend: "auto".into() }
+        MonitorConfig { enabled: true, model: String::new(), local_input: None, i2c_bus: None, backend: "auto".into(), follow_manual_switch: true }
     }
 }
 

@@ -212,6 +212,7 @@ pub enum Ev {
     Hotkey(u32),
     Ipc(Value, Sender<Value>),
     Discovered { key_hex: String, addr: SocketAddr, name: String },
+    MonitorManual(u16),
 }
 
 pub struct Engine {
@@ -332,6 +333,16 @@ impl Engine {
                     return true;
                 }
                 false
+            })));
+        }
+
+        // Monitor switched with its own buttons -> follow it.
+        {
+            let w = Arc::downgrade(&e);
+            e.monitor.set_on_manual(Some(Box::new(move |input| {
+                if let Some(e) = w.upgrade() {
+                    let _ = e.tx.send(Ev::MonitorManual(input));
+                }
             })));
         }
 
@@ -1326,6 +1337,7 @@ impl Engine {
                 log::info!("pointer returned to {}", p.name());
             }
             Ev::Hotkey(id) => self.on_hotkey(id),
+            Ev::MonitorManual(input) => self.on_monitor_manual(input),
             Ev::Ipc(req, reply) => {
                 let r = crate::ipc::handle(self, req);
                 let _ = reply.send(r);
@@ -1352,6 +1364,45 @@ impl Engine {
                     }
                 }
             },
+        }
+    }
+
+    /// The monitor now shows `input` and we did not switch it: move the
+    /// pointer to the computer on screen.
+    fn on_monitor_manual(self: &Arc<Self>, input: u16) {
+        if !self.cfg.read().unwrap().monitor.follow_manual_switch {
+            return;
+        }
+        let mine = self.monitor.status().local_input == Some(input);
+        let shown_peer = self.trusted_peers().into_iter().find(|p| p.info.lock().unwrap().monitor_input == Some(input));
+        let mut st = self.st.lock().unwrap();
+        let st = &mut *st;
+        if st.disabled {
+            return;
+        }
+        match (mine, st.mode.clone(), shown_peer) {
+            // The monitor now shows this computer.
+            (true, Mode::Remote { .. }, _) => self.end_remote(st, "monitor button", Some((0.5, Target::default()))),
+            (true, Mode::Local, _) => {
+                if let Some(p) = st.focus.clone() {
+                    std::thread::spawn(move || p.send(Ctrl::RequestFocus { target: Focus::Me }));
+                }
+            }
+            // The monitor now shows a peer.
+            (false, Mode::Local, Some(p)) => {
+                let has_pointer = st.last_phys_motion.is_some_and(|t| t.elapsed() < Duration::from_secs(120));
+                if has_pointer && st.focus.is_none() {
+                    let screens = self.screens.read().unwrap().clone();
+                    let (edge, seg) = st.links.iter().find(|(l, _)| l.peer == p.name()).map(|(l, r)| (l.edge, *r)).unwrap_or((Edge::Right, geom::desktop(&screens)));
+                    let park = geom::entry_point(&seg, edge, 0.5);
+                    self.begin_remote(st, p, edge, seg, 0.5, park, Target::default(), "monitor button");
+                }
+            }
+            (false, Mode::Hosted { peer, .. }, Some(p)) if Arc::ptr_eq(&peer, &p) => {}
+            (false, Mode::Hosted { peer, .. }, _) => {
+                std::thread::spawn(move || peer.send(Ctrl::RequestFocus { target: Focus::You }));
+            }
+            _ => {}
         }
     }
 
