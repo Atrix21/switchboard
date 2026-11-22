@@ -337,7 +337,7 @@ impl Engine {
         }
 
         // Monitor switched with its own buttons -> follow it.
-        {
+        if e.cfg.read().unwrap().monitor.follow_manual_switch {
             let w = Arc::downgrade(&e);
             e.monitor.set_on_manual(Some(Box::new(move |input| {
                 if let Some(e) = w.upgrade() {
@@ -1173,7 +1173,12 @@ impl Engine {
         let mut last_dial = Instant::now() - Duration::from_secs(10);
         let mut last_screen_scan = Instant::now();
         loop {
-            match rx.recv_timeout(Duration::from_millis(10)) {
+            // Fast ticks only while something time-critical is going on.
+            let busy = {
+                let st = self.st.lock().unwrap();
+                !matches!(st.mode, Mode::Local) || st.kb.target.is_some() || !st.ksink.pressed.is_empty()
+            };
+            match rx.recv_timeout(Duration::from_millis(if busy { 10 } else { 100 })) {
                 Ok(ev) => self.handle(ev),
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => return,

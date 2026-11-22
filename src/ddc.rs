@@ -104,6 +104,11 @@ impl Coordinator {
         self.inner.0.lock().unwrap().remote = f;
     }
 
+    /// Watching costs a DDC read every 1.5 s; only do it when someone listens.
+    pub fn watching(&self) -> bool {
+        self.inner.0.lock().unwrap().on_manual.is_some()
+    }
+
     pub fn set_on_manual(&self, f: Option<ManualFn>) {
         self.inner.0.lock().unwrap().on_manual = f;
     }
@@ -147,7 +152,7 @@ impl Coordinator {
                         let model = g.status.model.clone();
                         let quiet = g.last_switch.is_none_or(|t| t.elapsed() > Duration::from_secs(5));
                         drop(g);
-                        if !model.is_empty() && quiet {
+                        if !model.is_empty() && quiet && self.watching() {
                             self.watch(&model);
                         }
                         continue;
