@@ -74,7 +74,7 @@ Switchboard is the version where you just move the mouse.
 | File | For |
 | --- | --- |
 | `switchboard-x.y.z-windows-x64.zip` | Windows 11 (Windows 10 should work but hasn't been tested). Unzip and run `install.ps1`. Installs for your user, no admin needed (except one optional firewall prompt). |
-| `switchboard_x.y.z_amd64.deb` | Ubuntu 24.04 on X11 (tested), or other Debian-based distributions with WebKitGTK 4.1. `sudo apt install ./switchboard_*.deb` |
+| `switchboard_x.y.z_amd64.deb` | Ubuntu 24.04 on X11 or Wayland (tested), or other Debian-based distributions with WebKitGTK 4.1. `sudo apt install ./switchboard_*.deb` |
 
 Install it on both computers. Open it on both. Click **Pair**, check that the codes match, done.
 
@@ -200,6 +200,14 @@ Measured on the development pair: two laptops on the same 5 GHz Wi-Fi. Method an
 | CPU while idle | under 1% of one core |
 
 The network is the slow part, and on Wi-Fi it occasionally hiccups for 15–20 ms. A cable on either computer makes that go away. Switchboard sends input over UDP in a form where a lost or late packet costs nothing (each one carries the full state), so it doesn't stall behind a hiccup the way TCP does: at the 99th percentile, TCP was 2–5× slower on the same network.
+
+### Where the delay is (and isn't)
+
+**The computer your mouse and keyboard are connected to gets no added latency.** While the pointer is there, Switchboard only watches input; it isn't in the path. On Windows it uses Raw Input, which observes. The hooks that can block or delay input are installed only while the pointer is somewhere else, and removed when it returns. On Ubuntu it reads raw events and grabs nothing until the pointer leaves. The mouse and keyboard behave exactly as they would without Switchboard.
+
+**The other computer carries all of it:** one network hop (about half the round trip, so roughly 1 ms on good Wi-Fi) plus a few microseconds to apply the input. The app shows both side by side under *Where the delay is*.
+
+Two honest footnotes. The mouse and monitor still have their own latency, same as ever; Switchboard just doesn't add to it. And the keyboard follows the pointer, so if the keyboard is plugged into one computer while the pointer is on the other, typing crosses the network too (a Bluetooth keyboard paired directly to each computer doesn't).
 
 ## Frequently anticipated questions
 

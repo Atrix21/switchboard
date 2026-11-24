@@ -19,7 +19,7 @@
 5. **Sleep/wake and network-change tests** on real hardware; listen for `WM_POWERBROADCAST` / logind `PrepareForSleep` to reconnect immediately on resume.
 6. **Elevated windows on Windows**: optional elevated helper (or a service in the user session) so input works in admin windows; investigate VHF only if injection into the secure desktop is required.
 7. **Drag and drop of files across the edge** (currently copy/paste only).
-8. **Wayland**: injection already uses uinput; capture needs the compositor's input-capture portal (`org.freedesktop.portal.InputCapture`) and libei.
+8. **Wayland, exact cursor position**: Wayland support exists (evdev capture, uinput injection) but tracks the cursor position itself, so edge crossings are approximate. The compositor's input-capture portal (`org.freedesktop.portal.InputCapture`) with libei would make it exact and drop the udev rule.
 9. **macOS**: CGEventTap capture, CGEvent injection, IOAVService DDC (Apple Silicon) or IOKit I2C.
 10. **More than two computers**: pointer hand-off chains (A→B→C) and per-pair layouts in the desk view.
 

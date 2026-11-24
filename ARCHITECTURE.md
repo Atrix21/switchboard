@@ -97,10 +97,14 @@ LL hooks are installed only while forwarding, so normal local use runs with no h
 
 **Linux.** XInput2 raw events on the root window (device deltas, all buttons, keys), with an active pointer grab (invisible cursor) and keyboard grab while forwarding. Events from our own virtual devices and XTEST are filtered out by device id.
 
+**Linux, Wayland.** Wayland apps can't see or grab global input, so `platform/linux/evdev.rs` reads `/dev/input/event*` directly (access via the `uaccess` udev rule in `packaging/linux`) and grabs the devices with `EVIOCGRAB` while forwarding. Compositors don't report the cursor position, so it's tracked from raw deltas and our own absolute moves; edge crossings are therefore approximate on this backend. Chosen automatically (`XDG_SESSION_TYPE`, or a Wayland socket when started over SSH); override with `SWITCHBOARD_BACKEND=x11|evdev`. Xwayland is still used for screen geometry and the clipboard.
+
+**Latency.** While the pointer is local, nothing on any platform is in the input path (Raw Input sink on Windows, passive XI2 / evdev reads on Linux; hooks and grabs exist only while forwarding). The computer the peripherals are connected to therefore sees no added latency; only the receiving computer pays the network hop.
+
 ## Injection
 
 - **Windows**: `SendInput` (relative motion, so Windows ballistics apply when Linux forwards to Windows; scan-code keys).
-- **Linux**: uinput virtual pointer when `/dev/uinput` is accessible (kernel device, high-resolution wheel, libinput, future Wayland path), otherwise XTest. Keys via XTest (keycode = evdev + 8). Wire keycodes are Linux evdev codes (layout-independent positions); Windows maps them to scan code set 1.
+- **Linux**: uinput virtual pointer when `/dev/uinput` is accessible (kernel device, high-resolution wheel, libinput), otherwise XTest. Keys via XTest (keycode = evdev + 8). On Wayland: an absolute uinput pointer (so forwarded motion isn't accelerated twice, and warps are exact) and a uinput keyboard. Wire keycodes are Linux evdev codes (layout-independent positions); Windows maps them to scan code set 1.
 
 ## Monitor control
 

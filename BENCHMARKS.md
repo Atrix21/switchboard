@@ -49,6 +49,18 @@ From `switchboard status` after a session of real mouse use across both machines
 | Datagrams rejected (auth/replay) | 0 | |
 | Sequence gaps at the sink | 0 | |
 
+## Where latency applies
+
+Not a measurement, but a property of the design that the numbers above support: **on the computer the mouse and keyboard are connected to, Switchboard adds no latency, because it isn't in the input path while the pointer is there.**
+
+| Platform | While the pointer is local | While the pointer is on the other computer |
+|---|---|---|
+| Windows | Raw Input sink (observes only). No hooks installed. | `WH_MOUSE_LL` / `WH_KEYBOARD_LL` hooks installed; each callback costs 2 µs p50, 11 µs worst observed (section 3). |
+| Linux X11 | XInput2 raw events (observe only). No grabs. | Pointer and keyboard grabs. |
+| Linux Wayland | evdev read-only; devices not grabbed. | `EVIOCGRAB` on the devices. |
+
+The other computer pays one network hop (about half the round trip in sections 2 and 3) plus injection (section 3: <1 µs p50). The desktop app states this under *Where the delay is*. Physical end-to-end latency is still unmeasured (see the top of this file).
+
 ## 4. Micro-benchmarks
 
 | | p50 | p99 | Notes |
