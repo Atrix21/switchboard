@@ -610,6 +610,24 @@ function rttBlock(p) {
     <p class="muted">Round trip over your network. Input is sent the moment it happens; Switchboard itself adds about 0.02 ms.</p>`;
 }
 
+/* Where latency does and doesn't apply. Switchboard only observes input on the computer the
+   mouse and keyboard are connected to (no hook, no grab until the pointer leaves); only the
+   other computer pays for the network. */
+function latencyCard(peer) {
+  if (!peer || !peer.peer) return "";
+  const rtt = peer.peer.rtt_ms.p50;
+  const oneWay = rtt ? `about ${Math.max(0.1, rtt / 2).toFixed(1)} ms` : "one network hop";
+  return `<h3>Where the delay is</h3>
+    <div class="lat">
+      <div class="lat-col zero"><div class="lat-who">Computer your mouse and keyboard are connected to</div>
+        <div class="lat-big">+0<small>ms</small></div>
+        <p>Nothing is added. Switchboard watches input here without sitting in front of it, so the mouse and keyboard work exactly as they would without it.</p></div>
+      <div class="lat-col"><div class="lat-who">The other computer</div>
+        <div class="lat-big">${rtt ? "~" + Math.max(0.1, rtt / 2).toFixed(1) : "–"}<small>ms</small></div>
+        <p>The whole delay lives here: ${oneWay} across your network (half the ${rtt ? rtt.toFixed(1) + " ms" : ""} round trip), plus a few microseconds to apply the input.</p></div>
+    </div>`;
+}
+
 function overviewPanel(M) {
   const st = S.status;
   const peer = M.machines[1];
@@ -618,7 +636,7 @@ function overviewPanel(M) {
   return h(`
     <h2>${peer ? `${esc(M.machines[0].name)} and ${esc(peer.name)}` : esc(M.machines[0].name)}</h2>
     <p class="kind">${peer ? (M.focus === M.machines[0].name ? "The pointer is on this computer." : `The pointer is on ${esc(M.focus)}.`) : "Waiting for your other computer."}</p>
-    ${peer ? rttBlock(peer.peer) : `<div class="note">Install and open Switchboard on the other computer. When it's on the same network it shows up at the top of the desk, ready to pair.</div>`}
+    ${peer ? rttBlock(peer.peer) + latencyCard(peer) : `<div class="note">Install and open Switchboard on the other computer. When it's on the same network it shows up at the top of the desk, ready to pair.</div>`}
     ${peer ? `<h3>Connections</h3>
     <p class="muted">Each cable is one way: the pointer leaves where the jack is and arrives at the arrow. Drag from a jack on a screen's edge to another computer's screen to add one; click a cable to change it.</p>
     <div class="actions"><button class="quiet" data-act="recommend">Use recommended connections</button></div>` : ""}
