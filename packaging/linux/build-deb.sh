@@ -33,6 +33,8 @@ DESK
 fi
 # Let the logged-in user create the virtual pointer (no root at runtime).
 echo 'KERNEL=="uinput", SUBSYSTEM=="misc", TAG+="uaccess", OPTIONS+="static_node=uinput"' > "$PKG/usr/lib/udev/rules.d/60-switchboard-uinput.rules"
+# Wayland: read the physical mouse/keyboard (evdev) for the logged-in user.
+echo 'KERNEL=="event*", SUBSYSTEM=="input", TAG+="uaccess"' > "$PKG/usr/lib/udev/rules.d/70-switchboard-input.rules"
 cp README.md "$PKG/usr/share/doc/switchboard/"
 cat > "$PKG/DEBIAN/control" <<CTL
 Package: switchboard
@@ -52,6 +54,7 @@ cat > "$PKG/DEBIAN/postinst" <<'POST'
 set -e
 udevadm control --reload 2>/dev/null || true
 udevadm trigger --name-match=uinput 2>/dev/null || true
+udevadm trigger --subsystem-match=input --action=change 2>/dev/null || true
 POST
 chmod 755 "$PKG/DEBIAN/postinst"
 dpkg-deb --build --root-owner-group "$PKG" >/dev/null

@@ -1,4 +1,4 @@
-//! Linux/X11 backend.
+//! Linux backend: X11 (below), or Wayland via evdev/uinput (evdev.rs).
 //!
 //! * Screens: RandR 1.5 monitors, named "<EDID model> [<output>]".
 //! * Injection: XTest (works for any X11 user, no setup) or uinput (kernel
@@ -12,6 +12,7 @@
 
 pub mod clipboard;
 pub mod ddc;
+mod evdev;
 mod uinput;
 
 use std::io;
@@ -42,15 +43,85 @@ fn connect() -> io::Result<(RustConnection, xproto::Window)> {
 
 // ---------------------------------------------------------------- screens
 
+/// Which input backend this session needs.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Backend {
+    X11,
+    /// Wayland: evdev capture + uinput injection (see evdev.rs).
+    Evdev,
+}
+
+/// Chosen once. SWITCHBOARD_BACKEND=x11|evdev overrides; otherwise a Wayland
+/// session (XDG_SESSION_TYPE, or a Wayland socket when started over SSH) gets
+/// evdev. For Wayland also points DISPLAY/XAUTHORITY at the compositor's
+/// Xwayland, which we still use for screen geometry and the clipboard.
+pub fn backend() -> Backend {
+    static B: OnceLock<Backend> = OnceLock::new();
+    *B.get_or_init(|| {
+        let uid = unsafe { libc::getuid() };
+        let runtime = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| format!("/run/user/{uid}"));
+        let has_socket = std::fs::read_dir(&runtime).map(|d| d.flatten().any(|e| e.file_name().to_string_lossy().starts_with("wayland-") && !e.file_name().to_string_lossy().ends_with(".lock"))).unwrap_or(false);
+        let b = match std::env::var("SWITCHBOARD_BACKEND").as_deref() {
+            Ok("x11") => Backend::X11,
+            Ok("evdev") | Ok("wayland") => Backend::Evdev,
+            _ => match std::env::var("XDG_SESSION_TYPE").as_deref() {
+                Ok("wayland") => Backend::Evdev,
+                Ok("x11") => Backend::X11,
+                _ if has_socket => Backend::Evdev,
+                _ => Backend::X11,
+            },
+        };
+        if b == Backend::Evdev {
+            if std::env::var_os("DISPLAY").is_none() {
+                if let Some(n) = std::fs::read_dir("/tmp/.X11-unix").ok().and_then(|d| d.flatten().filter_map(|e| e.file_name().to_string_lossy().strip_prefix('X').and_then(|n| n.parse::<u32>().ok())).min()) {
+                    std::env::set_var("DISPLAY", format!(":{n}"));
+                }
+            }
+            if std::env::var_os("XAUTHORITY").is_none() {
+                let auth = std::fs::read_dir(&runtime).ok().and_then(|d| d.flatten().map(|e| e.path()).find(|p| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with(".mutter-Xwaylandauth."))));
+                if let Some(a) = auth {
+                    std::env::set_var("XAUTHORITY", a);
+                }
+            }
+            log::info!("Wayland session: evdev capture, uinput injection (DISPLAY={:?})", std::env::var("DISPLAY").ok());
+        }
+        b
+    })
+}
+
 pub fn screens() -> Vec<ScreenInfo> {
-    screens_inner().unwrap_or_else(|e| {
+    let _ = backend();
+    let v = screens_inner().unwrap_or_else(|e| {
         log::warn!("RandR: {e}");
         vec![]
-    })
+    });
+    if backend() == Backend::Evdev {
+        evdev::set_screens(v.iter().map(|s| s.rect).collect());
+    }
+    v
 }
 
 fn atom_name(c: &RustConnection, a: u32) -> String {
     c.get_atom_name(a).ok().and_then(|r| r.reply().ok()).map(|r| String::from_utf8_lossy(&r.name).to_string()).unwrap_or_default()
+}
+
+/// EDID model for an output name like "HDMI-1", read from the kernel's DRM
+/// connectors ("HDMI-A-1"). Xwayland doesn't expose the EDID property.
+fn drm_edid_model(out: &str) -> String {
+    let Ok(rd) = std::fs::read_dir("/sys/class/drm") else { return String::new() };
+    for e in rd.flatten() {
+        let n = e.file_name().to_string_lossy().to_string();
+        let Some((_, conn)) = n.split_once('-') else { continue };
+        if conn.replace("-A-", "-").replace("-D-", "-").replace("-I-", "-") != out {
+            continue;
+        }
+        if let Ok(d) = std::fs::read(e.path().join("edid")) {
+            if d.len() >= 128 {
+                return ddc::parse_edid(&d).1;
+            }
+        }
+    }
+    String::new()
 }
 
 fn screens_inner() -> io::Result<Vec<ScreenInfo>> {
@@ -69,6 +140,9 @@ fn screens_inner() -> io::Result<Vec<ScreenInfo>> {
                     }
                 }
             }
+        }
+        if model.is_empty() {
+            model = drm_edid_model(&out_name);
         }
         v.push(ScreenInfo {
             name: if model.is_empty() { out_name.clone() } else { format!("{model} [{out_name}]") },
@@ -192,6 +266,10 @@ impl Injector for XTestInjector {
 }
 
 pub fn new_injector() -> io::Result<Box<dyn Injector>> {
+    if backend() == Backend::Evdev {
+        let _ = screens(); // seeds the position tracker with the screen layout
+        return Ok(Box::new(evdev::WlInjector::new()?));
+    }
     let pref = std::env::var("SWITCHBOARD_INJECTOR").unwrap_or_default();
     if pref != "xtest" {
         match uinput::UinputInjector::new() {
@@ -340,6 +418,10 @@ fn hk_mods(h: &Hotkey) -> u16 {
 const IGNORED_MODS: [u16; 4] = [0, 2 /* Lock */, 16 /* Mod2=NumLock */, 18];
 
 pub fn start_capture(handler: Arc<dyn CaptureHandler>, opts: CaptureOptions) -> io::Result<Arc<dyn Capture>> {
+    if backend() == Backend::Evdev {
+        let _ = screens();
+        return evdev::start_capture(handler, opts);
+    }
     let (c, root) = connect()?;
     let xi = c.xinput_xi_query_version(2, 2).map_err(xerr)?.reply().map_err(xerr)?;
     if xi.major_version < 2 {
